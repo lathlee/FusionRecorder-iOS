@@ -1,0 +1,15 @@
+# Xcode 生成物：由 xcodegen 在 CI 生成，不提交
+*.xcodeproj/
+*.xcworkspace/
+DerivedData/
+build/
+*.ipa
+*.app
+.DS_Store
+
+# workflow 推到 ios-build 分支的日志与产物，工作区不留
+ci-logs/
+
+# Python 自检产生的缓存
+__pycache__/
+*.pyc
