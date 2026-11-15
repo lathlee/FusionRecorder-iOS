@@ -6,8 +6,9 @@
     <key>CFBundleDevelopmentRegion</key>
     <string>zh_CN</string>
 
+    <!-- 交接包 01_主项目_FusionRecorder/app/src/main/res/values/strings.xml 的 app_name -->
     <key>CFBundleDisplayName</key>
-    <string>融合录屏</string>
+    <string>融合录制</string>
 
     <key>CFBundleExecutable</key>
     <string>$(EXECUTABLE_NAME)</string>
