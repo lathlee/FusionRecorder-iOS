@@ -2,121 +2,85 @@
 //  VideoPipeline.swift
 //  FusionRecorder
 //
-//  视频管线骨架，对应交接包 §7 待办 2：
-//    VideoToolbox 双路解码 → Metal 合成 → VideoToolbox 编码 → AVAssetWriter 写相册
+//  录制侧管线。**不再有第二套合成算法**：录制每一帧都委托给
+//  FusionCompositor.render，参数对象与预览共用同一个 FusionParams。
 //
-//  v0.1 只落地类型与生命周期，把编译链路跑通；
-//  真实实现（含 alpha 0.55 / 加色混合 / 边缘 fade / 透视 skew 复刻 CompositorRenderer）
-//  在 v0.2 接真机联调时补齐，不在这里假装已实现。
+//  ★ 这就是「预览里调 OK，成片里不会变样」的代码级保证：
+//      预览  ── FusionParams ──> FusionCompositor.render ──> 预览画面
+//      录制  ── FusionParams ──> FusionCompositor.render ──> 写入帧
+//    两条路径只有输入帧的来源不同（已保存的截图 vs 实时流帧），
+//    画布尺寸、参数、像素运算完全相同。
+//
+//  v0.2 待办（交接包 §7）：双路 pts 对齐、VTCompressionSession 编码、
+//  AVAssetWriter 写 mp4 到相册。这些补齐后，写入的仍是本类 compose 的输出，
+//  不需要也不会重写合成逻辑。
 //
 
 import Foundation
 import AVFoundation
 import CoreMedia
 import CoreVideo
+import CoreGraphics
 import VideoToolbox
-import Metal
 import Photos
 
 enum PipelineError: Error, LocalizedError {
     case notImplemented
 
     var errorDescription: String? {
-        return "视频管线待实现（v0.2）"
+        return "逐帧编码 / 写相册待实现（v0.2）；合成部分已完成且与预览同源"
     }
 }
 
-/// 一路 H264 → CVPixelBuffer
-final class H264Decoder {
-    private var session: VTDecompressionSession?
-    private var formatDescription: CMVideoFormatDescription?
+/// 录制侧合成器：只做「转发到唯一合成入口」这一件事。
+final class RecordingCompositor {
+    private var params: FusionParams
+    private let lock = NSLock()
 
-    func configure(sps: Data, pps: Data) {
-        // TODO: CMVideoFormatDescriptionCreateFromH264ParameterSets
-        //       + VTDecompressionSessionCreate（输出 BGRA / NV12 像素格式）
-        _ = sps
-        _ = pps
+    init(params: FusionParams) {
+        self.params = params
     }
 
-    func decode(nal: Data, presentationTime: CMTime) {
-        // TODO: CMBlockBuffer → CMSampleBuffer → VTDecompressionSessionDecodeFrame
-        _ = nal
-        _ = presentationTime
+    /// 参数在预览里被拖动时由 UI 同步过来，保证录制用的是同一组数值
+    func update(_ newParams: FusionParams) {
+        lock.lock()
+        params = newParams
+        lock.unlock()
     }
 
-    func invalidate() {
-        if let session = session {
-            VTDecompressionSessionInvalidate(session)
-            self.session = nil
-        }
-        formatDescription = nil
-    }
-}
-
-/// 屏幕流（中心半透明面板）叠加到相机流（背景）
-final class MetalCompositor {
-    private let device: MTLDevice?
-    private let commandQueue: MTLCommandQueue?
-
-    init() {
-        device = MTLCreateSystemDefaultDevice()
-        commandQueue = device?.makeCommandQueue()
+    var currentParams: FusionParams {
+        lock.lock()
+        defer { lock.unlock() }
+        return params
     }
 
-    var isAvailable: Bool { device != nil }
-
-    func compose(screen: CVPixelBuffer, camera: CVPixelBuffer) -> CVPixelBuffer? {
-        // TODO: 复刻 CompositorRenderer（alpha 0.55 / 加色混合 / 边缘 fade / 透视 skew）
-        _ = commandQueue
-        _ = screen
-        _ = camera
-        return nil
+    /// 录制时的每一帧调用它。返回值就是要写进视频的那一帧。
+    func compose(screen: CGImage, camera: CGImage) -> CGImage? {
+        let p = currentParams
+        return FusionCompositor.render(screen: screen, camera: camera, params: p)
     }
 }
 
-/// 合成后的画面 → H264
-final class H264Encoder {
-    private var session: VTCompressionSession?
-
-    func configure(width: Int32, height: Int32) {
-        // TODO: VTCompressionSessionCreate(kCMVideoCodecType_H264) + 实时/低延迟设置
-        _ = width
-        _ = height
-    }
-
-    func encode(pixelBuffer: CVPixelBuffer, presentationTime: CMTime) {
-        // TODO: VTCompressionSessionEncodeFrame → CMSampleBuffer
-        _ = pixelBuffer
-        _ = presentationTime
-    }
-
-    func invalidate() {
-        if let session = session {
-            VTCompressionSessionInvalidate(session)
-            self.session = nil
-        }
-    }
-}
-
-/// H264 → mp4 → 相册
+/// 合成帧 → H264 → mp4 → 相册。
+/// v0.2 接入 VTCompressionSession + AVAssetWriter；输入必须是
+/// RecordingCompositor.compose 的输出，不允许在这里再做一次「效果调整」。
 final class MovieWriter {
     private var writer: AVAssetWriter?
     private var input: AVAssetWriterInput?
 
     func start(outputURL: URL, width: Int, height: Int) throws {
-        // TODO: AVAssetWriter + AVAssetWriterInput(H264) + startWriting/startSession
         _ = outputURL
         _ = width
         _ = height
+        throw PipelineError.notImplemented
     }
 
-    func append(sampleBuffer: CMSampleBuffer) {
-        // TODO: input?.append(sampleBuffer)
-        _ = sampleBuffer
+    func append(frame: CGImage, presentationTime: CMTime) {
+        _ = frame
+        _ = presentationTime
     }
 
     func finish(completion: @escaping (Result<URL, Error>) -> Void) {
-        // TODO: finishWriting → PHPhotoLibrary.shared().performChanges 保存到相册
         _ = writer
         _ = input
         completion(.failure(PipelineError.notImplemented))

@@ -8,8 +8,12 @@
 //
 
 import SwiftUI
+import CoreGraphics
+import UIKit
 
 struct RecordingOverlay: View {
+    /// 录制中的实时合成帧：与写进成片的是同一帧（RecordingCompositor 输出）
+    var image: CGImage?
     var onStop: () -> Void
 
     var body: some View {
@@ -17,6 +21,20 @@ struct RecordingOverlay: View {
             Palette.recordingBg.ignoresSafeArea()
 
             VStack(spacing: 14) {
+                if let image = image {
+                    Image(uiImage: UIImage(cgImage: image))
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 8)
+                                .stroke(Color.white.opacity(0.12), lineWidth: 1)
+                        )
+                    Text("上面的合成帧 = 正在写入成片的画面（同一合成器 / 同一参数）")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Palette.section)
+                        .multilineTextAlignment(.center)
+                }
                 Text("● 录制中")
                     .font(.system(size: 26, weight: .bold))
                     .foregroundStyle(Palette.green)
@@ -25,7 +43,7 @@ struct RecordingOverlay: View {
                     .font(.system(size: 15))
                     .foregroundStyle(Palette.label)
 
-                Text("v0.1 骨架：双路 H264 裸 TCP 接收已接入，\nMetal 实时合成与写相册待 v0.2")
+                Text("v0.1.2：双路 H264 解码 + 真实像素合成已接入，\n逐帧编码写相册待 v0.2")
                     .font(.system(size: 12))
                     .foregroundStyle(Palette.secondary)
                     .multilineTextAlignment(.center)
@@ -57,7 +75,7 @@ struct SaveDoneSheet: View {
                 .font(.system(size: 19, weight: .bold))
                 .foregroundStyle(.white)
 
-            Text("v0.1 骨架未产出成片；VideoToolbox 编码与写相册待 v0.2 接入。")
+            Text("v0.1.2 尚未产出 mp4 成片：合成帧已在录制中实时生成（与预览同源），VTCompressionSession 编码 + 写相册待 v0.2。")
                 .font(.system(size: 13))
                 .foregroundStyle(Palette.label)
 

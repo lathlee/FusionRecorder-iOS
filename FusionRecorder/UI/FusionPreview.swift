@@ -2,92 +2,86 @@
 //  FusionPreview.swift
 //  FusionRecorder
 //
-//  交接包 03_验证素材/融合录屏_单帧.png 的视觉复刻：暗相机背景 + 中央半透明
-//  「设置」页面板。面板由主界面的叠加效果滑杆实时驱动，用来标定
-//  alpha / scale / offset / corner / additive / brightness。
+//  v0.1.2：预览不再是 SwiftUI 手绘示意图，而是**真实像素合成结果**。
 //
-//  注意：这是 SwiftUI 绘制的**示意预览**，不是真实视频帧。
-//  v0.2 接上 VideoToolbox + Metal 双路管线后换成真实画面。
+//  输入：FrameStore 里的两帧真实画面（PoC 真实解码帧 / 眼镜抓帧 / 相册导入）
+//  处理：FusionCompositor.render —— 与录制写帧时调用的完全是同一个函数
+//  输出：UIImage，按成片宽高比显示（画布尺寸 = 成片分辨率，不是控件尺寸）
+//
+//  参数 token 一变就异步重算，用 generation 丢弃过期任务，滑杆拖动不卡 UI。
 //
 
 import SwiftUI
+import CoreGraphics
+import UIKit
 
 struct FusionPreview: View {
-    var alpha: Double
-    var scale: Double
-    var offsetX: Double
-    var offsetY: Double
-    var corner: Double
-    var additive: Double
-    var brightness: Double
+    let frames: FrameStore
+    let params: FusionParams
+    /// 由 ContentView 用 params.fingerprint + frames.revision 拼成，变化即重算
+    let token: String
+    @Binding var exported: UIImage?
 
-    private let rows = ["网络和互联网", "已连接的设备", "应用和通知", "电池", "显示", "定时开关机"]
-    private let rowColors: [Color] = [.blue, .green, .orange, .teal, .yellow, .blue]
-
-    private func panelWidth(_ fullWidth: CGFloat) -> CGFloat {
-        let clamped = min(max(scale, 0.2), 0.95)
-        return fullWidth * CGFloat(clamped) * 0.92
-    }
+    @State private var image: UIImage?
+    @State private var generation = 0
+    @State private var failed = false
 
     var body: some View {
-        GeometryReader { geo in
-            ZStack {
-                // 相机流背景（PoC 实测镜头朝下时偏暗的紫黑色）
-                LinearGradient(
-                    colors: [
-                        Color(red: 0.07, green: 0.05, blue: 0.07),
-                        Color(red: 0.02, green: 0.02, blue: 0.03)
-                    ],
-                    startPoint: .top,
-                    endPoint: .bottom
-                )
+        ZStack {
+            Palette.field
 
-                // 屏幕流叠加层（半透明设置页）
-                VStack(alignment: .leading, spacing: 0) {
-                    HStack(spacing: 6) {
-                        Text("设置")
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundStyle(Color(red: 0.15, green: 0.15, blue: 0.18))
-                        Spacer()
-                        Text("16:28")
-                            .font(.system(size: 9))
-                            .foregroundStyle(Color(red: 0.25, green: 0.25, blue: 0.28))
-                    }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 6)
-                    .background(Color(red: 0.80, green: 0.80, blue: 0.82).opacity(0.55))
-
-                    ForEach(0..<rows.count, id: \.self) { index in
-                        HStack(spacing: 8) {
-                            Circle()
-                                .fill(rowColors[index])
-                                .frame(width: 11, height: 11)
-                            Text(rows[index])
-                                .font(.system(size: 9))
-                                .foregroundStyle(Color(red: 0.18, green: 0.18, blue: 0.20))
-                            Spacer()
-                        }
-                        .padding(.horizontal, 10)
-                        .frame(height: geo.size.height * 0.06)
-                    }
-                    Spacer(minLength: 0)
+            if let image = image {
+                Image(uiImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+            } else if failed {
+                VStack(spacing: 6) {
+                    Image(systemName: "photo.badge.exclamationmark")
+                        .font(.system(size: 26))
+                        .foregroundStyle(Palette.hint)
+                    Text("真实帧未就绪")
+                        .font(.system(size: 12))
+                        .foregroundStyle(Palette.hint)
                 }
-                .frame(width: panelWidth(geo.size.width),
-                       height: panelWidth(geo.size.width) * 0.62)
-                .background(Color(red: 0.72, green: 0.72, blue: 0.74)
-                    .opacity(alpha * min(max(brightness, 0.5), 1.8)))
-                .clipShape(RoundedRectangle(cornerRadius: CGFloat(corner) * 60))
-                .shadow(color: Color.white.opacity(additive * 0.35),
-                        radius: CGFloat(additive) * 18)
-                .offset(x: CGFloat(offsetX) * geo.size.width * 0.5,
-                        y: CGFloat(-offsetY) * geo.size.height * 0.5)
+            } else {
+                ProgressView()
+                    .tint(Palette.section)
             }
-            .frame(width: geo.size.width, height: geo.size.height)
-            .clipShape(RoundedRectangle(cornerRadius: 8))
-            .overlay(
-                RoundedRectangle(cornerRadius: 8)
-                    .stroke(Color.white.opacity(0.08), lineWidth: 1)
-            )
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Color.white.opacity(0.08), lineWidth: 1)
+        )
+        .onAppear { recompute() }
+        .onChange(of: token) { _ in recompute() }
+    }
+
+    private func recompute() {
+        generation += 1
+        let mine = generation
+        let snapshot = params
+        let screen = frames.screenImage
+        let camera = frames.cameraImage
+
+        guard let screen = screen, let camera = camera else {
+            DispatchQueue.main.async {
+                self.failed = true
+                self.image = nil
+                self.exported = nil
+            }
+            return
+        }
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let cg = FusionCompositor.render(screen: screen, camera: camera, params: snapshot)
+            let result = cg.map { UIImage(cgImage: $0) }
+            DispatchQueue.main.async {
+                guard mine == self.generation else { return }  // 丢弃过期结果
+                self.failed = result == nil
+                self.image = result
+                self.exported = result
+            }
         }
     }
 }

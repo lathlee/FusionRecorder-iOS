@@ -2,29 +2,35 @@
 //  ContentView.swift
 //  FusionRecorder
 //
-//  严格复刻交接包 01_主项目_FusionRecorder/app/src/main/res/layout/activity_main.xml：
-//    深色 #121212 滚动页 → 标题「融合录制」→ 状态 → 4 个按钮 → 崩溃日志区
-//    → 「采集参数」6 个下拉 → 「叠加效果」10 条滑杆 → 底部取文件说明。
+//  布局严格复刻交接包 activity_main.xml（深色 #121212 → 标题「融合录制」→ 状态
+//  → 4 按钮 → 崩溃日志 → 采集参数 6 下拉 → 叠加效果 10 滑杆）。
+//  iPhone 端特有部分单独成组，不改原型视觉。
 //
-//  差异部分（iPhone 端特有，单独成组、不改原型视觉）：
-//    · 顶部「融合效果预览」示意（对应 03_验证素材/融合录屏_单帧.png）
-//    · 「iPhone 端连接」3 个输入框（眼镜 IP / 两路端口）
-//    · 录制中全屏页与录制完成弹窗（见 RecordingViews.swift）
-//
-//  所有参数用 @AppStorage 实时保存，下次打开保持（对齐 Android Prefs 行为）。
-//  v0.1 里这些参数只驱动预览示意，真实 VideoToolbox + Metal 管线待 v0.2。
+//  v0.1.2：预览换成**真实帧合成图**，并在预览下方增加「真实帧来源」区块。
+//  关键点：FusionParams 在下面由 10 条滑杆 + 2 个采集下拉组装成唯一一份，
+//  同时喂给预览（FusionPreview）和录制（RecorderSession / RecordingCompositor）。
+//  两条路径都调 FusionCompositor.render，因此预览里调好的参数就是成片里的效果。
 //
 
 import Foundation
 import SwiftUI
 import UIKit
+import PhotosUI
+import Photos
+import CoreGraphics
 
 struct ContentView: View {
     @StateObject private var session = RecorderSession()
+    @StateObject private var frames = FrameStore()
+
     @State private var showLog = false
     @State private var showRecording = false
     @State private var showSaveDone = false
     @State private var showProbeNote = false
+    @State private var currentComposite: UIImage?
+    @State private var saveNote = ""
+    @State private var screenPicker: PhotosPickerItem?
+    @State private var cameraPicker: PhotosPickerItem?
 
     // iPhone 端连接（交接包 §5：POC_PC_IP / POC_SCREEN_PORT / POC_CAM_PORT）
     @AppStorage("host") private var host = "192.168.101.133"
@@ -51,11 +57,36 @@ struct ContentView: View {
     @AppStorage("contrast") private var contrast = 1.0
     @AppStorage("crop") private var crop = 0.06
 
+    /// ★ 唯一一份参数：预览与录制共用
+    private var fusionParams: FusionParams {
+        let size = FusionParams.canvasSize(forResolutionIndex: resolutionIndex)
+        var p = FusionParams()
+        p.canvasWidth = size.width
+        p.canvasHeight = size.height
+        p.rotation = FusionParams.degrees(forRotationIndex: rotateIndex)
+        p.alpha = alpha
+        p.scale = scale
+        p.offsetX = offsetX
+        p.offsetY = offsetY
+        p.additive = additive
+        p.corner = corner
+        p.edgeFade = edge
+        p.brightness = brightness
+        p.contrast = contrast
+        p.crop = crop
+        return p
+    }
+
+    /// 参数 / 帧来源 / 帧版本任一变化都触发重新合成
+    private var renderToken: String {
+        "\(fusionParams.fingerprint)|rev\(frames.revision)|\(frames.origin.rawValue)"
+    }
+
     private var statusText: String {
         if session.isRunning {
-            return "采集中：屏幕 NAL \(session.screenNALCount) / 相机 NAL \(session.cameraNALCount)"
+            return "采集中：屏幕 NAL \(session.screenNALCount) / 相机 NAL \(session.cameraNALCount)；下方预览与录制中的合成帧使用同一套参数。"
         }
-        return "准备就绪。开始后通过无线 ADB 启动眼镜采集，两路 H264 裸 TCP 回到 iPhone 合成（v0.1 骨架）。"
+        return "预览 = 成片同源：两帧真实画面经同一合成器渲染，画布 \(fusionParams.canvasWidth)×\(fusionParams.canvasHeight)。拖动下方滑杆即刻更新。"
     }
 
     var body: some View {
@@ -73,28 +104,77 @@ struct ContentView: View {
                         .foregroundStyle(Palette.secondary)
                         .padding(.top, 4)
 
-                    // 融合效果预览（示意，对应交接包成片单帧）
-                    FusionPreview(
-                        alpha: alpha,
-                        scale: scale,
-                        offsetX: offsetX,
-                        offsetY: offsetY,
-                        corner: corner,
-                        additive: additive,
-                        brightness: brightness
-                    )
-                    .frame(height: 190)
-                    .padding(.top, 12)
+                    // ---- 真实帧合成预览（成片宽高比，画布 = 成片分辨率）----
+                    FusionPreview(frames: frames, params: fusionParams,
+                                  token: renderToken, exported: $currentComposite)
+                        .aspectRatio(Double(fusionParams.canvasWidth) / Double(fusionParams.canvasHeight),
+                                     contentMode: .fit)
+                        .padding(.top, 12)
 
                     HStack {
-                        Text("融合效果预览（示意）")
+                        Text("融合效果预览 · 真实帧合成")
                         Spacer()
-                        Text("v0.1 无真实视频管线")
+                        Text("预览 = 成片同源")
+                            .foregroundStyle(Palette.section)
                     }
                     .font(.system(size: 11))
                     .foregroundStyle(Palette.hint)
                     .padding(.top, 4)
 
+                    // ---- 真实帧来源（v0.1.2 新增）----
+                    sectionTitle("真实帧来源")
+                    Text(frames.origin.rawValue + "：" + frames.note)
+                        .font(.system(size: 11))
+                        .foregroundStyle(Palette.label)
+                        .padding(.top, 2)
+
+                    HStack(spacing: 8) {
+                        smallButton(session.captureInProgress ? "抓帧中…" : "从眼镜抓两帧") {
+                            session.captureFrames(host: host,
+                                                  screenPort: UInt16(screenPort) ?? 9114,
+                                                  cameraPort: UInt16(cameraPort) ?? 9115)
+                        }
+                        smallButton("恢复内置真实帧") { frames.resetToSample() }
+                    }
+                    .padding(.top, 6)
+
+                    if !session.captureState.isEmpty && session.captureState != "未抓帧" {
+                        Text(session.captureState)
+                            .font(.system(size: 11))
+                            .foregroundStyle(session.captureInProgress ? Palette.section : Palette.hint)
+                            .padding(.top, 4)
+                    }
+
+                    HStack(spacing: 8) {
+                        PhotosPicker(selection: $screenPicker, matching: .images) {
+                            smallLabel("导入屏幕帧")
+                        }
+                        .onChange(of: screenPicker) { item in
+                            loadPicked(item, isScreen: true)
+                        }
+                        PhotosPicker(selection: $cameraPicker, matching: .images) {
+                            smallLabel("导入相机帧")
+                        }
+                        .onChange(of: cameraPicker) { item in
+                            loadPicked(item, isScreen: false)
+                        }
+                        smallButton("保存当前合成帧") { saveCurrentFrame() }
+                    }
+                    .padding(.top, 6)
+
+                    if !saveNote.isEmpty {
+                        Text(saveNote)
+                            .font(.system(size: 11))
+                            .foregroundStyle(Palette.section)
+                            .padding(.top, 4)
+                    }
+
+                    Text("抓帧：眼镜端两路推流服务要先起来（9114 屏幕 / 9115 相机）。连不上时可直接从相册导入两张真实截图，参数照样实时生效。保存的合成帧可与日后成片逐帧比对。")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Palette.hint)
+                        .padding(.top, 4)
+
+                    // ---- 原型 4 个按钮 ----
                     actionButton(session.isRunning ? "停止录制" : "开始录制", prominent: true) {
                         toggleRecording()
                     }
@@ -160,7 +240,7 @@ struct ContentView: View {
                         .foregroundStyle(Palette.hint)
                         .padding(.top, 4)
 
-                    Text("取成片：相册（v0.2 接入 AVAssetWriter 后自动保存）")
+                    Text("取成片：相册（v0.2 接入 AVAssetWriter 后自动保存）；预览帧已可单独保存核对。")
                         .font(.system(size: 11))
                         .foregroundStyle(Palette.hint)
                         .padding(.top, 16)
@@ -169,7 +249,7 @@ struct ContentView: View {
             }
 
             if showRecording {
-                RecordingOverlay(onStop: {
+                RecordingOverlay(image: session.livePreview, onStop: {
                     session.stop()
                     showRecording = false
                     showSaveDone = true
@@ -178,6 +258,13 @@ struct ContentView: View {
             }
         }
         .preferredColorScheme(.dark)
+        .onAppear {
+            session.frameStore = frames
+            session.update(params: fusionParams)
+        }
+        .onChange(of: fusionParams) { newValue in
+            session.update(params: newValue)
+        }
         .sheet(isPresented: $showSaveDone) {
             SaveDoneSheet(onPlay: { openPhotos() }, onClose: { showSaveDone = false })
                 .presentationDetents([.medium])
@@ -185,7 +272,7 @@ struct ContentView: View {
         .alert("检测屏幕采集", isPresented: $showProbeNote) {
             Button("好", role: .cancel) { }
         } message: {
-            Text("v0.1 骨架：ADB RSA 认证与眼镜端抓屏探测待真机联调。当前可先点「开始录制」，在日志区看两路 H264 的 NAL 计数。")
+            Text("v0.1.2：直接点上方「从眼镜抓两帧」即可连 9114/9115 各解一帧真实画面，合成后作为预览源。ADB RSA 授权仍需真机联调；连不上时可用相册导入两张真实截图。")
         }
     }
 
@@ -209,6 +296,24 @@ struct ContentView: View {
                 .clipShape(RoundedRectangle(cornerRadius: 6))
         }
         .buttonStyle(.plain)
+    }
+
+    private func smallButton(_ title: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            smallLabel(title)
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func smallLabel(_ title: String) -> some View {
+        Text(title)
+            .font(.system(size: 11))
+            .foregroundStyle(Palette.title)
+            .lineLimit(1)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 8)
+            .background(Palette.field)
+            .clipShape(RoundedRectangle(cornerRadius: 6))
     }
 
     private func pickerRow(_ title: String, selection: Binding<Int>, options: [String]) -> some View {
@@ -267,12 +372,40 @@ struct ContentView: View {
 
     // MARK: - 行为
 
+    private func loadPicked(_ item: PhotosPickerItem?, isScreen: Bool) {
+        guard let item = item else { return }
+        Task {
+            if let data = try? await item.loadTransferable(type: Data.self) {
+                await MainActor.run {
+                    frames.applyImported(data: data, isScreen: isScreen)
+                    saveNote = isScreen ? "屏幕帧已替换" : "相机帧已替换"
+                }
+            }
+        }
+    }
+
+    private func saveCurrentFrame() {
+        guard let image = currentComposite else {
+            saveNote = "合成帧还没生成"
+            return
+        }
+        PHPhotoLibrary.shared().performChanges {
+            PHAssetChangeRequest.creationRequestForAsset(from: image)
+        } completionHandler: { success, error in
+            DispatchQueue.main.async {
+                saveNote = success ? "当前合成帧已保存到相册，可与成片逐帧比对"
+                                  : "保存失败：\(error?.localizedDescription ?? "无权限")"
+            }
+        }
+    }
+
     private func toggleRecording() {
         if session.isRunning {
             session.stop()
             showRecording = false
             showSaveDone = true
         } else {
+            session.update(params: fusionParams)
             session.start(host: host,
                           screenPort: UInt16(screenPort) ?? 9114,
                           cameraPort: UInt16(cameraPort) ?? 9115)

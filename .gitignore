@@ -13,3 +13,6 @@ ci-logs/
 # Python 自检产生的缓存
 __pycache__/
 *.pyc
+
+# 离线生成的对照效果图只作为本地交付物，不进仓库
+preview/

@@ -18,8 +18,9 @@ settings:
     SWIFT_VERSION: "5.9"
     # 版本号全局唯一来源：CI 读它决定 IPA 文件名与 SideStore 源版本
     # 0.1.1 = 界面按交接文件复刻（activity_main.xml / 融合成片预览）
-    MARKETING_VERSION: "0.1.1"
-    CURRENT_PROJECT_VERSION: "2"
+    # 0.1.2 = 预览换成真实帧合成，且预览/录制共用唯一合成器与参数（WYSIWYG）
+    MARKETING_VERSION: "0.1.2"
+    CURRENT_PROJECT_VERSION: "3"
     # 侧载不需要 Apple 签名，签名交给 SideStore / AltStore 用免费 Apple ID 做
     CODE_SIGNING_ALLOWED: "NO"
     CODE_SIGNING_REQUIRED: "NO"
@@ -44,7 +45,10 @@ targets:
       - path: FusionRecorder/Stream
       - path: FusionRecorder/Pipeline
       - path: FusionRecorder/Session
+      - path: FusionRecorder/Frame
       - path: FusionRecorder/Assets.xcassets
+        buildPhase: resources
+      - path: FusionRecorder/Resources
         buildPhase: resources
 
     settings:
