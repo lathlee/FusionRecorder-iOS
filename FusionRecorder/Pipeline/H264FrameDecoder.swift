@@ -177,8 +177,9 @@ final class H264FrameDecoder {
             flags: [],
             frameRefcon: nil,
             infoFlagsOut: &infoFlags)
-        // 抓帧是同步操作，等回调落地再返回，保证 latest 已就绪
-        _ = VTDecompressionSessionWaitForSynchronousFrames(session)
+        // iOS SDK 没有 WaitForSynchronousFrames；用 WaitForAsynchronousFrames
+        // 等解码回调落地再返回，保证 latest 已就绪（抓帧是低频操作，可阻塞）
+        _ = VTDecompressionSessionWaitForAsynchronousFrames(session)
     }
 
     private func onDecoded(_ buffer: CVImageBuffer) {
