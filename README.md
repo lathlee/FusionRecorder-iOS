@@ -6,7 +6,7 @@
 
 ---
 
-## 现状（v0.1.2，诚实标注）
+## 现状（v0.2 开发中，诚实标注）
 
 | 模块 | 状态 |
 |---|---|
@@ -14,14 +14,23 @@
 | **真实帧融合预览**（PoC 真实解码帧 / 眼镜抓帧 / 相册导入） | 已实现，滑杆实时重算 |
 | **预览与成片同源合成**（`FusionCompositor` 单一入口） | 已实现，逐像素复刻 Android shader |
 | 双路裸 TCP H264 接收 + Annex-B NAL 拆包（半包/粘包） | 已实现 |
-| VideoToolbox 单帧解码（用于从眼镜抓帧、录制中实时合成帧） | 已实现 |
-| 逐帧 `VTCompressionSession` 编码 + `AVAssetWriter` 写 mp4 到相册 | **仍待 v0.2** |
-| 双路流 pts 封装 / ADB RSA 真机授权 | 未做（交接包 §7 待办 1 / 2，正式出片的前提） |
+| VideoToolbox 双路持续解码 | 已实现 |
+| **SEI pts 解析**（`FusionPtsParser`，与眼镜端 `PtsSei.java` 字节级一致） | v0.2 已实现 |
+| **pts 锚点对齐帧队列 + 20fps CFR 输出** | v0.2 已实现 |
+| **AVAssetWriter 逐帧写 mp4 + 保存相册**（`MovieWriter`） | v0.2 已实现，真机待联调 |
+| **离线成片基准**（真实双路样本 → pts 对齐 → 10s/200 帧成片） | v0.2 已生成，见下 |
+| ADB RSA 真机授权 / 自动发现眼镜 / ADB 自动启动两路流 | 待办（交接包 §7 待办 2） |
 
-**v0.1.2 解决的是「预览调好了，成片却变样」这个具体问题**：预览不再是手绘示意图，
-而是两张真实画面经**与录制完全相同的合成函数 + 同一份参数 + 同一个画布分辨率**渲染出的像素。
-还没做的是把合成帧逐帧编码成 mp4（v0.2），但那条路径已经预留为直接消费合成器的输出，
-不会、也不需要重写合成逻辑。
+**v0.1.2 解决的是「预览调好了，成片却变样」**：预览换成与录制同源的真实像素合成。
+**v0.2 解决的是「成片本身」**：把双路帧按设备端真实 pts 对齐，逐帧编码成 mp4 写相册，
+时间轴用真实时间戳而不是按帧号均匀铺。合成仍只发生在 `FusionCompositor.render` 一处，
+`MovieWriter` 只消费它的输出，不碰任何画面参数。
+
+**v0.2 离线基准**：用交接包两段真实 H264（屏幕 87 帧 / 相机 97 帧，帧数不同）跑通
+「补 pts → 按 pts 锚点对齐 → CFR 补帧 → 合成 → 成片」，产出
+`preview/v0.2_离线基准.mp4`（10s / 200 帧 / 1280×720 / 20fps）与逐帧清单
+`preview/v0.2_基准清单.json`。真机成片可与之逐帧比对，判断参数/时间轴是否走样。
+复现：`python3 tools/build_offline_baseline.py`。
 
 ## 界面（按交接文件复刻）
 
@@ -68,9 +77,10 @@ Android 合成器对不上，而录制侧又是空 TODO —— 这正是「预�
 各用 VideoToolbox 解一帧替换；③ 从相册导入两张真实截图。选中帧持久化，重启仍在。
 「保存当前合成帧」把这一帧存进相册，方便日后与成片逐帧比对。
 
-> **诚实标注**：逐帧编码写 mp4 仍是 v0.2；ADB RSA 授权未联调，所以「从眼镜抓帧」需要
-> 眼镜端推流服务已经启动，连不上时用相册导入同样能标定参数。录制中页面显示的实时合成帧
-> 已经由同一个合成器产出，不是占位图。
+> **诚实标注**：v0.2 的 mp4 写入代码已完成并通过离线基准验证，但**本机没有 Xcode、眼镜不在手边**，
+> 真机「录制 → 写相册」的运行时行为尚未联调。ADB RSA 授权也未联调，所以「从眼镜抓帧 / 开始录制」
+> 需要眼镜端推流服务已经启动，且 iPhone 与眼镜在同一局域网；连不上时用相册导入同样能标定参数。
+> 录制中页面显示的实时合成帧由同一个合成器产出，不是占位图。
 
 ## 目标架构
 
@@ -91,7 +101,7 @@ iPhone 开热点时眼镜连热点，`POC_PC_IP` 对应 iPhone 在该网段地�
 - workflow：`.github/workflows/build-ipa.yml`
 - `xcodegen generate` 生成 `.xcodeproj` → `xcodebuild -sdk iphoneos CODE_SIGNING_ALLOWED=NO` → 打 `Payload/` zip 成未签名 `.ipa`
 - 产物与日志推到本仓库的 `ios-build` 分支（匿名可读），同时上传 Actions artifact（保留 30 天）
-- 取产物：`https://raw.githubusercontent.com/<owner>/FusionRecorder-iOS/ios-build/ci-logs/FusionRecorder-0.1.2-unsigned.ipa`
+- 取产物：`https://raw.githubusercontent.com/<owner>/FusionRecorder-iOS/ios-build/ci-logs/FusionRecorder-0.2.0-unsigned.ipa`
 - 侧载签名：SideStore / AltStore + 免费 Apple ID，7 天续签（交接包 §7 待办 6）
 
 ## 推送与云端编译

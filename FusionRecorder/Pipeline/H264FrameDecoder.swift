@@ -24,13 +24,29 @@ final class H264FrameDecoder {
     private var formatDescription: CMVideoFormatDescription?
     private var session: VTDecompressionSession?
     private var latest: CGImage?
+    private var pendingPTS: FusionPTS?
     private let lock = NSLock()
     private let ciContext = CIContext()
 
-    /// 喂入一个不含起始码的 NAL；返回当前已解出的最新画面（拿到 IDR 前为 nil）。
+    /// v0.1 兼容接口：返回当前已解出的最新画面（拿到 IDR 前为 nil）。
+    /// 抓帧（captureFrames）仍用它；新代码请用 feedWithPTS 拿真实时间戳。
     func feed(_ nal: Data) -> CGImage? {
+        return feedWithPTS(nal)?.image
+    }
+
+    /// v0.2 录制接口：解析 SEI pts，返回「帧 + 设备端单调时钟微秒」。
+    /// 同一 NAL 里的 SEI 一定在 VCL 前到达；心跳 SEI 后没有画面帧，
+    /// 只更新 pendingPTS 而不返回帧。老裸流（无 SEI）时 ptsUs 取到达时刻近似。
+    func feedWithPTS(_ nal: Data) -> (image: CGImage, ptsUs: Int64)? {
         guard let header = nal.first else { return nil }
         switch header & 0x1f {
+        case 6:                       // SEI：解析 pts（v0.1 走 default 忽略，兼容）
+            if let parsed = FusionPtsParser.parse(nal) {
+                lock.lock()
+                pendingPTS = parsed
+                lock.unlock()
+            }
+            return nil
         case 7:                       // SPS
             sps = nal
         case 8:                       // PPS
@@ -43,7 +59,10 @@ final class H264FrameDecoder {
         }
         lock.lock()
         defer { lock.unlock() }
-        return latest
+        guard let image = latest else { return nil }
+        let pts = pendingPTS?.ptsUs ?? Int64(Date().timeIntervalSince1970 * 1_000_000)
+        pendingPTS = nil   // 一个 pts 绑定一个画面帧，不串到下一帧
+        return (image, pts)
     }
 
     var decodedFrame: CGImage? {
@@ -63,6 +82,7 @@ final class H264FrameDecoder {
         pps = nil
         lock.lock()
         latest = nil
+        pendingPTS = nil
         lock.unlock()
     }
 

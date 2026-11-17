@@ -11,9 +11,9 @@
 //    两条路径只有输入帧的来源不同（已保存的截图 vs 实时流帧），
 //    画布尺寸、参数、像素运算完全相同。
 //
-//  v0.2 待办（交接包 §7）：双路 pts 对齐、VTCompressionSession 编码、
-//  AVAssetWriter 写 mp4 到相册。这些补齐后，写入的仍是本类 compose 的输出，
-//  不需要也不会重写合成逻辑。
+//  v0.2：MovieWriter 用 AVAssetWriter + VT 的 PixelBufferAdaptor 逐帧写 mp4，
+//  时间轴用设备端真实 pts（微秒）；成片完成后写相册。
+//  写入的仍是 RecordingCompositor.compose 的输出，不在这里做任何效果调整。
 //
 
 import Foundation
@@ -23,12 +23,25 @@ import CoreVideo
 import CoreGraphics
 import VideoToolbox
 import Photos
+import UIKit
 
 enum PipelineError: Error, LocalizedError {
-    case notImplemented
+    case invalidState(String)
+    case writerSetupFailed(String)
+    case appendFailed(String)
+    case finishFailed(String)
+    case photoSaveFailed(String)
+    case noFrames
 
     var errorDescription: String? {
-        return "逐帧编码 / 写相册待实现（v0.2）；合成部分已完成且与预览同源"
+        switch self {
+        case .invalidState(let s): return "录制状态错误：\(s)"
+        case .writerSetupFailed(let s): return "编码器初始化失败：\(s)"
+        case .appendFailed(let s): return "写入帧失败：\(s)"
+        case .finishFailed(let s): return "封装成片失败：\(s)"
+        case .photoSaveFailed(let s): return "保存到相册失败：\(s)"
+        case .noFrames: return "没有可写入的帧"
+        }
     }
 }
 
@@ -62,27 +75,229 @@ final class RecordingCompositor {
 }
 
 /// 合成帧 → H264 → mp4 → 相册。
-/// v0.2 接入 VTCompressionSession + AVAssetWriter；输入必须是
-/// RecordingCompositor.compose 的输出，不允许在这里再做一次「效果调整」。
+///
+/// 输入：CGImage（由 RecordingCompositor.compose 产出）+ 微秒 pts。
+/// 输出：保存到相册的 mp4。
+///
+/// 关键设计：
+///  · 用 AVAssetWriter + PixelBufferAdaptor，编码参数固定 H264 / yuv420p；
+///  · 时间轴用设备端真实 pts（公共单调时钟微秒），首帧归零，timescale=1_000_000；
+///  · 所有写操作在私有串行队列，避免 AVAssetWriter 的线程约束；
+///  · 这里绝不修改画面——合成只在 FusionCompositor 里发生一次。
 final class MovieWriter {
+
+    private enum State {
+        case idle
+        case writing
+        case finishing
+        case finished
+    }
+
     private var writer: AVAssetWriter?
     private var input: AVAssetWriterInput?
+    private var adaptor: AVAssetWriterInputPixelBufferAdaptor?
+    private var state: State = .idle
+    private let queue = DispatchQueue(label: "com.lath.fusionrecorder.moviewriter")
+    private var outputURL: URL?
+    private var firstPTS: Int64?
+    private var frameCount = 0
+    private var lastPTS: Int64 = -1
 
-    func start(outputURL: URL, width: Int, height: Int) throws {
-        _ = outputURL
-        _ = width
-        _ = height
-        throw PipelineError.notImplemented
+    /// 合成画布尺寸（由 FusionParams 决定， = 成片分辨率）
+    private let width: Int
+    private let height: Int
+
+    init(width: Int, height: Int) {
+        self.width = width
+        self.height = height
     }
 
-    func append(frame: CGImage, presentationTime: CMTime) {
-        _ = frame
-        _ = presentationTime
+    /// 开始一次录制。outputURL 由调用方给（临时目录里的 .mp4）。
+    func start(outputURL: URL) throws {
+        guard state == .idle else {
+            throw PipelineError.invalidState("start 只能在 idle 调用，当前 \(state)")
+        }
+
+        let fileManager = FileManager.default
+        if fileManager.fileExists(atPath: outputURL.path) {
+            try? fileManager.removeItem(at: outputURL)
+        }
+
+        guard let assetWriter = try? AVAssetWriter(outputURL: outputURL, fileType: .mp4) else {
+            throw PipelineError.writerSetupFailed("AVAssetWriter(outputURL:) 返回 nil")
+        }
+
+        let settings: [String: Any] = [
+            AVVideoCodecKey: AVVideoCodecType.h264,
+            AVVideoWidthKey: width,
+            AVVideoHeightKey: height,
+            AVVideoCompressionPropertiesKey: [
+                AVVideoAverageBitRateKey: 4_000_000,
+                AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel
+            ] as [String: Any]
+        ]
+        let writerInput = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
+        writerInput.expectsMediaDataInRealTime = true
+
+        let pixelAttrs: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
+            kCVPixelBufferWidthKey as String: width,
+            kCVPixelBufferHeightKey as String: height
+        ]
+        let pixelAdaptor = AVAssetWriterInputPixelBufferAdaptor(
+            assetWriterInput: writerInput,
+            sourcePixelBufferAttributes: pixelAttrs)
+
+        guard assetWriter.canAdd(writerInput) else {
+            throw PipelineError.writerSetupFailed("canAdd(input) == false")
+        }
+        assetWriter.add(writerInput)
+
+        writer = assetWriter
+        input = writerInput
+        adaptor = pixelAdaptor
+        self.outputURL = outputURL
+        firstPTS = nil
+        frameCount = 0
+        lastPTS = -1
+
+        assetWriter.startWriting()
+        // 首帧的实际 pts 要等第一帧到了才知道，先用 0 起会话；
+        // 写入帧时统一减去 firstPTS，保证时间轴从 0 开始且单调递增。
+        assetWriter.startSession(atSourceTime: .zero)
+        state = .writing
     }
 
+    /// 写一帧。presentationTimeUs 是设备端单调时钟微秒（绝对路径）。
+    /// 调用方必须按时间顺序调用（v0.2 的帧队列已按 pts 排好序）。
+    func append(frame: CGImage, presentationTimeUs: Int64) throws {
+        guard state == .writing else {
+            throw PipelineError.invalidState("append 时状态 \(state)")
+        }
+        guard presentationTimeUs >= lastPTS else {
+            throw PipelineError.invalidState("pts 非递增：\(presentationTimeUs) <= \(lastPTS)")
+        }
+        lastPTS = presentationTimeUs
+        if firstPTS == nil { firstPTS = presentationTimeUs }
+
+        guard let buffer = Self.pixelBuffer(from: frame, width: width, height: height) else {
+            throw PipelineError.appendFailed("CGImage → CVPixelBuffer 失败")
+        }
+        let pts = presentationTimeUs - (firstPTS ?? presentationTimeUs)
+        let time = CMTime(value: pts, timescale: 1_000_000)
+
+        // AVAssetWriterInput 要求串行 append；这里同步等每次写完再返回。
+        let error = queue.sync { () -> Error? in
+            guard let input = input, let adaptor = adaptor else {
+                return PipelineError.invalidState("writer input 丢失")
+            }
+            // isReadyForMoreMediaData 为 false 时短暂等待，避免丢帧
+            var waited = 0
+            while !input.isReadyForMoreMediaData && waited < 100 {
+                Thread.sleep(forTimeInterval: 0.002)
+                waited += 1
+            }
+            guard input.isReadyForMoreMediaData else {
+                return PipelineError.appendFailed("input 长时间 not ready")
+            }
+            guard adaptor.append(buffer, withPresentationTime: time) else {
+                return PipelineError.appendFailed("adaptor.append 返回 false")
+            }
+            return nil
+        }
+        if let error = error { throw error }
+        frameCount += 1
+    }
+
+    /// 结束录制：标记 input finished → finishWriting → 保存到相册。
     func finish(completion: @escaping (Result<URL, Error>) -> Void) {
-        _ = writer
-        _ = input
-        completion(.failure(PipelineError.notImplemented))
+        guard state == .writing else {
+            completion(.failure(PipelineError.invalidState("finish 时状态 \(state)")))
+            return
+        }
+        guard frameCount > 0 else {
+            completion(.failure(PipelineError.noFrames))
+            return
+        }
+        state = .finishing
+        input?.markAsFinished()
+
+        writer?.finishWriting { [weak self] in
+            guard let self = self else { return }
+            let writerError = self.writer?.error
+            if let writerError = writerError {
+                completion(.failure(PipelineError.finishFailed(writerError.localizedDescription)))
+                return
+            }
+            guard let url = self.outputURL else {
+                completion(.failure(PipelineError.finishFailed("输出 URL 丢失")))
+                return
+            }
+            self.state = .finished
+            self.saveToPhotoLibrary(url: url, completion: completion)
+        }
+    }
+
+    /// 放弃录制（停止时还没开始写或出错）
+    func cancel() {
+        queue.sync {
+            if state == .writing {
+                writer?.cancelWriting()
+            }
+            state = .finished
+            writer = nil
+            input = nil
+            adaptor = nil
+        }
+    }
+
+    var writtenFrames: Int { frameCount }
+
+    // MARK: - 私有
+
+    private func saveToPhotoLibrary(url: URL, completion: @escaping (Result<URL, Error>) -> Void) {
+        PHPhotoLibrary.shared().performChanges({
+            PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: url)
+        }) { success, error in
+            if success {
+                completion(.success(url))
+            } else {
+                completion(.failure(PipelineError.photoSaveFailed(
+                    error?.localizedDescription ?? "未知错误")))
+            }
+        }
+    }
+
+    /// CGImage → CVPixelBuffer（BGRA，预乘 alpha，与合成器输出一致）。
+    static func pixelBuffer(from image: CGImage, width: Int, height: Int) -> CVPixelBuffer? {
+        var pixelBuffer: CVPixelBuffer?
+        let attrs: [CFString: Any] = [
+            kCVPixelBufferCGImageCompatibilityKey: kCFBooleanTrue as Any,
+            kCVPixelBufferCGBitmapContextCompatibilityKey: kCFBooleanTrue as Any
+        ]
+        let status = CVPixelBufferCreate(
+            kCFAllocatorDefault, width, height,
+            kCVPixelFormatType_32BGRA,
+            attrs as CFDictionary,
+            &pixelBuffer)
+        guard status == kCVReturnSuccess, let buffer = pixelBuffer else { return nil }
+
+        CVPixelBufferLockBaseAddress(buffer, [])
+        defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
+
+        guard let context = CGContext(
+            data: CVPixelBufferGetBaseAddress(buffer),
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: CVPixelBufferGetBytesPerRow(buffer),
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
+                | CGBitmapInfo.byteOrder32Little.rawValue
+        ) else {
+            return nil
+        }
+        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+        return buffer
     }
 }

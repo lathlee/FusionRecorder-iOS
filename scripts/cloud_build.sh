@@ -59,7 +59,7 @@ git symbolic-ref HEAD refs/heads/main
 git config user.name "${GIT_AUTHOR_NAME:-WorkBuddy}"
 git config user.email "${GIT_AUTHOR_EMAIL:-workbuddy@users.noreply.github.com}"
 git add -A
-git commit -qm "feat: FusionRecorder-iOS v0.1 工程骨架 + 云端编译 workflow" || echo "(内容无变化)"
+git commit -qm "feat: FusionRecorder-iOS v0.2 工程 + 云端编译 workflow" || echo "(内容无变化)"
 # 沙箱里 github.com:443 的 git smart HTTP 不可达，改用 api.github.com
 "$PY" scripts/push_via_api.py "$OWNER" "$REPO" "$ROOT"
 

@@ -6,7 +6,8 @@
 //  → 4 按钮 → 崩溃日志 → 采集参数 6 下拉 → 叠加效果 10 滑杆）。
 //  iPhone 端特有部分单独成组，不改原型视觉。
 //
-//  v0.1.2：预览换成**真实帧合成图**，并在预览下方增加「真实帧来源」区块。
+//  v0.2：录制打通「双路 H264 → SEI pts 对齐 → 合成 → H264 写 mp4 → 相册」，
+//  录制完成页等写入回调再弹（不再假装成功）。
 //  关键点：FusionParams 在下面由 10 条滑杆 + 2 个采集下拉组装成唯一一份，
 //  同时喂给预览（FusionPreview）和录制（RecorderSession / RecordingCompositor）。
 //  两条路径都调 FusionCompositor.render，因此预览里调好的参数就是成片里的效果。
@@ -26,6 +27,7 @@ struct ContentView: View {
     @State private var showLog = false
     @State private var showRecording = false
     @State private var showSaveDone = false
+    @State private var isFinishing = false
     @State private var showProbeNote = false
     @State private var currentComposite: UIImage?
     @State private var saveNote = ""
@@ -249,11 +251,26 @@ struct ContentView: View {
             }
 
             if showRecording {
-                RecordingOverlay(image: session.livePreview, onStop: {
+                RecordingOverlay(image: session.livePreview,
+                                 frameCount: session.recordedFrameCount,
+                                 onStop: {
+                    // v0.2：stop() 异步封装成片，等写入回调再弹完成页
                     session.stop()
-                    showRecording = false
-                    showSaveDone = true
+                    isFinishing = true
                 })
+                .ignoresSafeArea()
+            }
+
+            if isFinishing {
+                ZStack {
+                    Palette.recordingBg.opacity(0.85).ignoresSafeArea()
+                    VStack(spacing: 12) {
+                        ProgressView()
+                        Text("正在封装成片并保存相册…")
+                            .font(.system(size: 14))
+                            .foregroundStyle(Palette.label)
+                    }
+                }
                 .ignoresSafeArea()
             }
         }
@@ -265,14 +282,35 @@ struct ContentView: View {
         .onChange(of: fusionParams) { newValue in
             session.update(params: newValue)
         }
+        // 成片写入是异步的：只有拿到结果才收起录制页、弹完成页
+        .onChange(of: session.finishedMovieURL) { url in
+            if url != nil {
+                isFinishing = false
+                showRecording = false
+                showSaveDone = true
+            }
+        }
+        .onChange(of: session.recordError) { error in
+            if error != nil && isFinishing {
+                isFinishing = false
+                showRecording = false
+                showSaveDone = true
+            }
+        }
         .sheet(isPresented: $showSaveDone) {
-            SaveDoneSheet(onPlay: { openPhotos() }, onClose: { showSaveDone = false })
+            SaveDoneSheet(movieURL: session.finishedMovieURL,
+                          errorMessage: session.recordError,
+                          onPlay: { openPhotos() },
+                          onClose: {
+                showSaveDone = false
+                session.clearRecordResult()
+            })
                 .presentationDetents([.medium])
         }
         .alert("检测屏幕采集", isPresented: $showProbeNote) {
             Button("好", role: .cancel) { }
         } message: {
-            Text("v0.1.2：直接点上方「从眼镜抓两帧」即可连 9114/9115 各解一帧真实画面，合成后作为预览源。ADB RSA 授权仍需真机联调；连不上时可用相册导入两张真实截图。")
+            Text("v0.2：录制已接入真实 pts 对齐与 mp4 写入。点「开始录制」后同步收 9114/9115 两路，按时间戳配对合成并写入相册。ADB RSA 授权仍需真机联调；连不上时流接收不受影响。")
         }
     }
 
@@ -402,9 +440,9 @@ struct ContentView: View {
     private func toggleRecording() {
         if session.isRunning {
             session.stop()
-            showRecording = false
-            showSaveDone = true
+            isFinishing = true
         } else {
+            session.clearRecordResult()
             session.update(params: fusionParams)
             session.start(host: host,
                           screenPort: UInt16(screenPort) ?? 9114,

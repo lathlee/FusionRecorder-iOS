@@ -2,18 +2,51 @@
 //  RecorderSession.swift
 //  FusionRecorder
 //
-//  把 ADB + 双路流 + 唯一合成器串起来，并给 SwiftUI 提供状态。
+//  把 ADB + 双路流 + 唯一合成器 + 成片写入串起来，并给 SwiftUI 提供状态。
 //
 //  ★ 预览 / 抓帧 / 录制 三条路径都指向同一个 FusionCompositor：
 //    · 预览：FrameStore 的两张真实帧 → FusionCompositor（FusionPreview 负责显示）
 //    · 抓帧：9114 / 9115 各解一帧 → 存进 FrameStore → 立刻成为新的预览源
-//    · 录制：双路实时帧 → RecordingCompositor（内部同样调 FusionCompositor）
+//    · 录制：双路实时帧 + 真实 pts → 帧队列锚点对齐 → RecordingCompositor → MovieWriter
 //  参数统一由 ContentView 组装成 FusionParams 后 update 进来，不存在两套数值。
+//
+//  v0.2 pts 对齐（与 PROTOCOL.md §6 一致）：
+//    两路帧率不同（20/30fps），不能按帧号配对。每路维护 (pts, CGImage) 队列，
+//    以 t0 = min(两路首帧 pts) 为零点，按 20fps 生成目标时刻，
+//    每路取「pts 不晚于目标时刻的最后一帧」送合成器 —— 静止画面自然重复上一帧。
 //
 
 import Foundation
 import Combine
 import CoreGraphics
+import UIKit
+
+/// 一路带时间戳的帧队列。只保留最近若干帧，按 pts 升序（采集端写 TCP 即时间戳）。
+private final class TimedFrameQueue {
+    private var frames: [(pts: Int64, image: CGImage)] = []
+    private let capacity = 300          // 15 秒 @20fps，足够应对抖动
+
+    func append(pts: Int64, image: CGImage) {
+        frames.append((pts, image))
+        if frames.count > capacity {
+            frames.removeFirst(frames.count - capacity)
+        }
+    }
+
+    /// pts 不晚于 target 的最后一帧。没有更早帧时退回第一帧。
+    func anchor(before target: Int64) -> (image: CGImage, pts: Int64)? {
+        guard let first = frames.first else { return nil }
+        var chosen = first
+        for f in frames {
+            if f.pts <= target { chosen = f } else { break }
+        }
+        return (chosen.image, chosen.pts)
+    }
+
+    var firstPTS: Int64? { frames.first?.pts }
+    var isEmpty: Bool { frames.isEmpty }
+    func clear() { frames.removeAll() }
+}
 
 final class RecorderSession: ObservableObject {
 
@@ -25,6 +58,16 @@ final class RecorderSession: ObservableObject {
     @Published private(set) var livePreview: CGImage?
     @Published private(set) var captureState = "未抓帧"
     @Published private(set) var captureInProgress = false
+    /// v0.2：成片已写好的通知（URL 为相册里的临时 mp4，已同步到相册）
+    @Published private(set) var finishedMovieURL: URL?
+    @Published private(set) var recordError: String?
+    /// 已写入帧数（UI 录制页显示）
+    @Published private(set) var recordedFrameCount: Int = 0
+
+    func clearRecordResult() {
+        finishedMovieURL = nil
+        recordError = nil
+    }
 
     /// 抓到的真实帧交给它保存，随后自动成为预览源
     weak var frameStore: FrameStore?
@@ -47,7 +90,16 @@ final class RecorderSession: ObservableObject {
     private var liveCamera: CGImage?
     private var capturedScreen: CGImage?
     private var capturedCamera: CGImage?
-    private var lastComposeAt: TimeInterval = 0
+
+    // ---- v0.2：pts 对齐帧队列 + CFR 定时输出 + 成片写入 ----
+    private var screenQueue = TimedFrameQueue()
+    private var cameraQueue = TimedFrameQueue()
+    private var movieWriter: MovieWriter?
+    private var cfrTimer: DispatchSourceTimer?
+    private let cfrQueue = DispatchQueue(label: "com.lath.fusionrecorder.cfr")
+    private var timelineOriginUs: Int64?
+    private var outputFrameIndex: Int64 = 0
+    private let outputFPS: Int64 = 20
 
     /// UI 在每次参数变化时调用，保证录制用的就是预览里那组数值
     func update(params: FusionParams) {
@@ -62,21 +114,49 @@ final class RecorderSession: ObservableObject {
         guard !isRunning else { return }
         isRunning = true
         livePreview = nil
+        finishedMovieURL = nil
+        recordError = nil
+        recordedFrameCount = 0
         append("启动：ADB \(host):5555 / 屏幕 \(screenPort) / 相机 \(cameraPort)")
         append("合成参数：\(params.fingerprint)")
+        append("v0.2：pts 锚点对齐，\(outputFPS)fps CFR 输出，成片写相册")
 
+        // 成片分辨率 = 合成画布 = 预览画布（三者同一份 FusionParams）
+        let size = params.renderSize
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("fusion_rec_\(Int(Date().timeIntervalSince1970)).mp4")
+        let writer = MovieWriter(width: size.width, height: size.height)
+        do {
+            try writer.start(outputURL: url)
+            movieWriter = writer
+            append("编码器就绪：\(size.width)×\(size.height) / H264 / \(outputFPS)fps")
+        } catch {
+            recordError = "编码器启动失败：\(error.localizedDescription)"
+            append(recordError!)
+            isRunning = false
+            return
+        }
+
+        // ADB 只负责启动/授权；视频流不挤进 adb 通道
         let client = ADBClient(host: host, port: 5555)
         client.log = { [weak self] message in self?.append("[ADB] \(message)") }
         adb = client
         client.connect { [weak self] result in
             switch result {
             case .success: self?.append("ADB 握手完成")
-            case .failure(let error): self?.append("ADB 连接失败：\(error.localizedDescription)")
+            case .failure(let error): self?.append("ADB 连接失败：\(error.localizedDescription)（流仍可单独接收）")
             }
         }
 
         screenDecoder = H264FrameDecoder()
         cameraDecoder = H264FrameDecoder()
+        frameLock.lock()
+        screenQueue.clear()
+        cameraQueue.clear()
+        timelineOriginUs = nil
+        outputFrameIndex = 0
+        frameLock.unlock()
+
         let screen = H264StreamReceiver(host: host, port: screenPort, label: "screen",
             onNAL: { [weak self] nal in
                 self?.bumpScreen()
@@ -94,41 +174,133 @@ final class RecorderSession: ObservableObject {
         cameraReceiver = camera
         screen.start()
         camera.start()
+
+        startCFRTimer()
     }
 
     func stop() {
         guard isRunning else { return }
         isRunning = false
+        stopCFRTimer()
+
         screenReceiver?.stop()
         cameraReceiver?.stop()
         adb?.disconnect()
         screenDecoder.invalidate()
         cameraDecoder.invalidate()
+
         frameLock.lock()
         liveScreen = nil
         liveCamera = nil
+        screenQueue.clear()
+        cameraQueue.clear()
         frameLock.unlock()
-        append("已停止（合成帧已按预览参数生成；逐帧编码写相册待 v0.2）")
+
+        guard let writer = movieWriter, writer.writtenFrames > 0 else {
+            movieWriter?.cancel()
+            movieWriter = nil
+            append("已停止（没有可写入的帧）")
+            return
+        }
+        append("正在封装成片（\(writer.writtenFrames) 帧）…")
+        writer.finish { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                switch result {
+                case .success(let url):
+                    self.finishedMovieURL = url
+                    self.append("成片已保存到相册：\(url.lastPathComponent)")
+                case .failure(let error):
+                    self.recordError = error.localizedDescription
+                    self.append("成片失败：\(error.localizedDescription)")
+                }
+                self.movieWriter = nil
+            }
+        }
     }
 
-    /// 双路各来一帧就合成一次（做节流，CPU 逐像素合成不追赶 30fps）
+    /// 每来一个 NAL：解出帧 → 带 pts 入对应队列。
+    /// 合成不再在这里做，改由 CFR 定时器按统一时间轴驱动（避免帧率不同导致错配）。
     private func handleLive(_ nal: Data, isScreen: Bool) {
         let decoder = isScreen ? screenDecoder : cameraDecoder
-        guard let frame = decoder.feed(nal) else { return }
+        guard let result = decoder.feedWithPTS(nal) else { return }
 
         frameLock.lock()
-        if isScreen { liveScreen = frame } else { liveCamera = frame }
+        if isScreen {
+            screenQueue.append(pts: result.ptsUs, image: result.image)
+        } else {
+            cameraQueue.append(pts: result.ptsUs, image: result.image)
+        }
+        // t0 = 两路都有帧后，取两路首帧中较早者（PROTOCOL.md §6）
+        if timelineOriginUs == nil {
+            if let s = screenQueue.firstPTS, let c = cameraQueue.firstPTS {
+                timelineOriginUs = min(s, c)
+                append("两路首帧 pts 差 \(abs(s - c)) μs，时间零点已建立")
+            }
+        }
         let s = liveScreen
         let c = liveCamera
-        let now = Date().timeIntervalSince1970
-        let shouldCompose = (s != nil && c != nil && now - lastComposeAt > 0.12)
-        if shouldCompose { lastComposeAt = now }
         frameLock.unlock()
 
-        guard shouldCompose, let s = s, let c = c else { return }
-        let composed = recordingCompositor.compose(screen: s, camera: c)
-        DispatchQueue.main.async { [weak self] in
-            self?.livePreview = composed
+        // 录制页的实时预览：仍显示两路最新帧的合成结果（与写入帧同源）
+        if isScreen {
+            frameLock.lock(); liveScreen = result.image; frameLock.unlock()
+        } else {
+            frameLock.lock(); liveCamera = result.image; frameLock.unlock()
+        }
+        if let s = s, let c = c, let composed = recordingCompositor.compose(screen: s, camera: c) {
+            DispatchQueue.main.async { [weak self] in self?.livePreview = composed }
+        }
+    }
+
+    // MARK: - CFR 定时输出（20fps）
+
+    private func startCFRTimer() {
+        let timer = DispatchSource.makeTimerSource(queue: cfrQueue)
+        timer.schedule(deadline: .now() + 0.1, repeating: .milliseconds(1000 / Int(outputFPS)))
+        timer.setEventHandler { [weak self] in self?.tickCFR() }
+        timer.resume()
+        cfrTimer = timer
+    }
+
+    private func stopCFRTimer() {
+        cfrTimer?.cancel()
+        cfrTimer = nil
+    }
+
+    private func tickCFR() {
+        guard isRunning, let writer = movieWriter else { return }
+        frameLock.lock()
+        let origin = timelineOriginUs
+        let sEmpty = screenQueue.isEmpty
+        let cEmpty = cameraQueue.isEmpty
+        frameLock.unlock()
+        guard let t0 = origin, !sEmpty, !cEmpty else { return }
+
+        let targetUs = t0 + outputFrameIndex * 1_000_000 / outputFPS
+        frameLock.lock()
+        let s = screenQueue.anchor(before: targetUs)
+        let c = cameraQueue.anchor(before: targetUs)
+        frameLock.unlock()
+        guard let s = s, let c = c else { return }
+
+        guard let composed = recordingCompositor.compose(screen: s.image, camera: c.image) else { return }
+        do {
+            // 用目标 CFR 时刻作 pts：静止帧自然重复，时间轴均匀无漂移
+            try writer.append(frame: composed, presentationTimeUs: targetUs)
+            outputFrameIndex += 1
+            if outputFrameIndex % 20 == 0 {
+                DispatchQueue.main.async { [weak self] in
+                    self?.recordedFrameCount = Int(writer.writtenFrames)
+                }
+            }
+            if outputFrameIndex % 40 == 0 {
+                append("已写 \(outputFrameIndex) 帧（t=\(Double(targetUs - t0) / 1e6)s）")
+            }
+        } catch {
+            recordError = error.localizedDescription
+            append("写帧失败：\(error.localizedDescription)")
+            stop()
         }
     }
 

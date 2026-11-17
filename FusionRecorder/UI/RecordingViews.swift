@@ -4,7 +4,7 @@
 //
 //  复刻交接包 activity_recording.xml（录制中全屏页）与
 //  activity_save_done.xml（录制完成弹窗）的深色布局。
-//  文案按 iPhone 端 v0.1 的真实能力做了诚实标注，不假装已出片。
+//  v0.2：录制中显示「已写入 N 帧」；完成后显示成片状态（真机写相册待联调）。
 //
 
 import SwiftUI
@@ -14,6 +14,7 @@ import UIKit
 struct RecordingOverlay: View {
     /// 录制中的实时合成帧：与写进成片的是同一帧（RecordingCompositor 输出）
     var image: CGImage?
+    var frameCount: Int = 0
     var onStop: () -> Void
 
     var body: some View {
@@ -39,11 +40,11 @@ struct RecordingOverlay: View {
                     .font(.system(size: 26, weight: .bold))
                     .foregroundStyle(Palette.green)
 
-                Text("摄像头正在录制")
-                    .font(.system(size: 15))
+                Text("已写入 \(frameCount) 帧 · 按真实 pts 对齐")
+                    .font(.system(size: 13))
                     .foregroundStyle(Palette.label)
 
-                Text("v0.1.2：双路 H264 解码 + 真实像素合成已接入，\n逐帧编码写相册待 v0.2")
+                Text("v0.2：双路 H264 解码 + SEI pts 对齐 + 逐帧 H264 编码写 mp4。\n成片与预览共用同一合成器，参数效果一致。")
                     .font(.system(size: 12))
                     .foregroundStyle(Palette.secondary)
                     .multilineTextAlignment(.center)
@@ -66,28 +67,43 @@ struct RecordingOverlay: View {
 }
 
 struct SaveDoneSheet: View {
+    var movieURL: URL?
+    var errorMessage: String?
     var onPlay: () -> Void
     var onClose: () -> Void
 
+    private var isSuccess: Bool { movieURL != nil }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("录制完成")
+            Text(isSuccess ? "录制完成" : ("写入失败" ))
                 .font(.system(size: 19, weight: .bold))
                 .foregroundStyle(.white)
 
-            Text("v0.1.2 尚未产出 mp4 成片：合成帧已在录制中实时生成（与预览同源），VTCompressionSession 编码 + 写相册待 v0.2。")
-                .font(.system(size: 13))
-                .foregroundStyle(Palette.label)
-
-            Button(action: onPlay) {
-                Text("播放")
-                    .font(.system(size: 16))
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 8)
+            if isSuccess {
+                Text("成片已按真实时间戳写入并保存到相册。合成画面与预览同源，预览里调好的参数就是成片里的效果。\n\n文件：\(movieURL?.lastPathComponent ?? "")")
+                    .font(.system(size: 13))
+                    .foregroundStyle(Palette.label)
+            } else {
+                Text(errorMessage ?? "未知错误")
+                    .font(.system(size: 13))
+                    .foregroundStyle(Palette.label)
+                Text("常见原因：没有收到两路帧、编码器初始化失败、或相册权限未开。可看主界面日志排查。")
+                    .font(.system(size: 12))
+                    .foregroundStyle(Palette.secondary)
             }
-            .buttonStyle(.borderedProminent)
-            .tint(Palette.accent)
-            .padding(.top, 10)
+
+            if isSuccess {
+                Button(action: onPlay) {
+                    Text("打开相册")
+                        .font(.system(size: 16))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 8)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(Palette.accent)
+                .padding(.top, 10)
+            }
 
             Button(action: onClose) {
                 Text("完成")
