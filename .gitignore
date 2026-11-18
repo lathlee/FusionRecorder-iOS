@@ -16,3 +16,6 @@ __pycache__/
 
 # 离线生成的对照效果图只作为本地交付物，不进仓库
 preview/
+
+# cloud_build.sh 记录的本次 commit sha，本地临时状态，不进仓库
+.last_commit_sha
