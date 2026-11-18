@@ -102,7 +102,7 @@ def main():
     parents = [ref["object"]["sha"]] if code == 200 and "object" in ref else []
     code, result = req(
         "POST", f"{BASE}/git/commits",
-        {"message": "feat(v0.2): MovieWriter 逐帧写 mp4 + SEI pts 对齐 + 20fps CFR 帧队列",
+        {"message": "feat(v0.3): ADB 自动化骨架（发现/AUTH/sync push/命令状态机）+ 全自动监听接收",
          "tree": tree_sha, "parents": parents},
     )
     if code not in (200, 201):

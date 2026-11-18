@@ -2,11 +2,11 @@
 //  H264StreamReceiver.swift
 //  FusionRecorder
 //
-//  一路裸 TCP H264 流接收。眼镜端用 MediaCodec 硬编后直接 write(socket)，
-//  输出是 Annex-B（00 00 00 01 / 00 00 01 起始码）裸流，没有容器、没有 pts。
+//  一路裸 TCP H264 流【客户端】接收：iPhone 主动连眼镜的 9114/9115。
+//  用于手动「从眼镜抓两帧」——这时眼镜端是 server。
+//  全自动部署走 H264StreamListener（采集端主动连 iPhone），方向相反、两条路径并存。
 //
-//  v0.1 已实现：TCP 长连接、半包/粘包处理、按起始码切出完整 NAL。
-//  TODO(v0.2)：每个 NAL 前带上设备端 pts（交接包 §7 待办 1），交给解码器。
+//  Annex-B 拆 NAL 复用 H264NALSplitter 单一真源（与 Listener 一致）。
 //
 
 import Foundation
@@ -15,9 +15,9 @@ import Network
 final class H264StreamReceiver {
     private let connection: NWConnection
     private let queue: DispatchQueue
+    private let splitter = H264NALSplitter()
     private let onNAL: (Data) -> Void
     private let onState: (String) -> Void
-    private var buffer = Data()
     private var running = false
 
     init(host: String,
@@ -67,44 +67,10 @@ final class H264StreamReceiver {
             }
             if let data = data {
                 self.queue.async {
-                    self.buffer.append(data)
-                    self.drainNALs()
+                    self.splitter.feed(data, onNAL: self.onNAL)
                 }
             }
             if !isComplete { self.receiveLoop() }
         }
-    }
-
-    /// Annex-B 拆包：只有两个起始码之间的 NAL 才算完整，末尾不完整的留到下一次。
-    private func drainNALs() {
-        var starts: [Int] = []
-        var i = 0
-        let count = buffer.count
-        while i + 3 <= count {
-            let b0 = buffer[i]
-            let b1 = buffer[i + 1]
-            let b2 = buffer[i + 2]
-            if b0 == 0 && b1 == 0 && b2 == 1 {
-                starts.append(i)
-                i += 3
-            } else if i + 4 <= count && b0 == 0 && b1 == 0 && b2 == 0 && buffer[i + 3] == 1 {
-                starts.append(i)
-                i += 4
-            } else {
-                i += 1
-            }
-        }
-
-        guard starts.count >= 2 else { return }
-
-        for index in 0..<(starts.count - 1) {
-            let from = starts[index]
-            let to = starts[index + 1]
-            let prefixLength = (buffer[from + 2] == 0) ? 4 : 3
-            let nal = Data(buffer[(from + prefixLength)..<to])
-            if !nal.isEmpty { onNAL(nal) }
-        }
-
-        buffer.removeSubrange(0..<starts[starts.count - 1])
     }
 }

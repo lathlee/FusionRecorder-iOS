@@ -6,20 +6,25 @@
 
 ---
 
-## 现状（v0.2 开发中，诚实标注）
+## 现状（v0.3 开发中，诚实标注）
 
 | 模块 | 状态 |
 |---|---|
 | SwiftUI 界面（严格复刻 `activity_main.xml`） | 已实现 |
 | **真实帧融合预览**（PoC 真实解码帧 / 眼镜抓帧 / 相册导入） | 已实现，滑杆实时重算 |
 | **预览与成片同源合成**（`FusionCompositor` 单一入口） | 已实现，逐像素复刻 Android shader |
-| 双路裸 TCP H264 接收 + Annex-B NAL 拆包（半包/粘包） | 已实现 |
+| 双路裸 TCP H264 接收 + Annex-B NAL 拆包（半包/粘包） | 已实现（客户端 + 监听端共用 `H264NALSplitter`） |
 | VideoToolbox 双路持续解码 | 已实现 |
 | **SEI pts 解析**（`FusionPtsParser`，与眼镜端 `PtsSei.java` 字节级一致） | v0.2 已实现 |
 | **pts 锚点对齐帧队列 + 20fps CFR 输出** | v0.2 已实现 |
 | **AVAssetWriter 逐帧写 mp4 + 保存相册**（`MovieWriter`） | v0.2 已实现，真机待联调 |
 | **离线成片基准**（真实双路样本 → pts 对齐 → 10s/200 帧成片） | v0.2 已生成，见下 |
-| ADB RSA 真机授权 / 自动发现眼镜 / ADB 自动启动两路流 | 待办（交接包 §7 待办 2） |
+| **自动发现眼镜**（上次 IP 优先 + `/24` 网段扫 5555） | v0.3 已实现（`GlassesDiscovery`） |
+| **ADB AUTH 状态机**（Keychain 持久 RSA + SIGNATURE→PUBLICKEY） | v0.3 已实现，ROM 授权框行为待真机联调 |
+| **sync push**（把 APK/JAR 推到眼镜，AOSP SYNC.TXT 字节规格） | v0.3 已实现（`ADBSyncPusher`），离线自测通过 |
+| **自动部署编排**（发现→授权→校验 shell→push→安装→授权→启动两路→保活） | v0.3 已实现（`CaptureOrchestrator`） |
+| **全自动监听接收**（采集端主动连 iPhone，iPhone 监听 9114/9115） | v0.3 已实现（`H264StreamListener`） |
+| **ADB 协议离线自测**（假 adbd 走 AUTH/shell/sync + 命令交叉核对） | v0.3 已实现，`python3 tools/adb_autotest.py` 3/3 通过 |
 
 **v0.1.2 解决的是「预览调好了，成片却变样」**：预览换成与录制同源的真实像素合成。
 **v0.2 解决的是「成片本身」**：把双路帧按设备端真实 pts 对齐，逐帧编码成 mp4 写相册，
@@ -31,6 +36,26 @@
 `preview/v0.2_离线基准.mp4`（10s / 200 帧 / 1280×720 / 20fps）与逐帧清单
 `preview/v0.2_基准清单.json`。真机成片可与之逐帧比对，判断参数/时间轴是否走样。
 复现：`python3 tools/build_offline_baseline.py`。
+
+**v0.3 解决的是「眼镜端要人手敲一堆 adb 命令」**：把交接包 `DEPLOY.md` 的命令串成
+一条状态机。点「① 自动部署采集端」→ App 扫 5555 找到眼镜（上次 IP 优先）→ ADB 握手
+（首次在眼镜上点「允许调试」）→ 校验 `id` 是 shell(uid=2000) → 用 ADB `sync:` 把内置
+的 `fusion-capture.apk` / `screen-push.jar` 推到 `/data/local/tmp` → `pm install` +
+`pm grant CAMERA` → 下发屏幕流（`app_process`，shellDetached 长期通道）和相机流
+（`am start-foreground-service`）。点「② 全自动录制」则部署完直接开录。
+
+采集端是**主动连 iPhone** 的（启动命令里 `--es host` 填的是 iPhone 的局域网 IP），
+所以全自动录制用 `H264StreamListener` 在 9114/9115 **监听**；老的手动抓帧仍用
+`H264StreamReceiver`（iPhone 主动连眼镜），两者方向相反、并存不冲突。
+两条 TCP 路径共用同一个 `H264NALSplitter` 拆 NAL，不会出现两套实现漂移。
+
+> **诚实边界（v0.3）**：AUTH 的 RSA 签名是按标准 ADB 实现的，密钥存 Keychain；
+> 唯一无法离线验证的是这台 ROM 在收到 `AUTH_PUBLICKEY` 后是否弹授权框——其余步骤
+> （CNXN / SIGNATURE / PUBLICKEY→CNXN / shell 多片输出 / sync SEND-DATA-DONE 字节 /
+> 全部命令串）都由 `tools/adb_autotest.py` 起真实 TCP 假 adbd 逐字节验证过。
+> 真机联调时若授权环节卡住，用 `ADBAuth.shared.resetKey()` 清密钥重连，或先看
+> app 的「部署日志」。另外：`pm install` 会覆盖眼镜上同包名的旧采集端；采集端 APK/JAR
+> 是打进本 IPA 资源的，更新采集端代码后需重新编译本 App 才会带上新版。
 
 ## 界面（按交接文件复刻）
 
@@ -101,7 +126,7 @@ iPhone 开热点时眼镜连热点，`POC_PC_IP` 对应 iPhone 在该网段地�
 - workflow：`.github/workflows/build-ipa.yml`
 - `xcodegen generate` 生成 `.xcodeproj` → `xcodebuild -sdk iphoneos CODE_SIGNING_ALLOWED=NO` → 打 `Payload/` zip 成未签名 `.ipa`
 - 产物与日志推到本仓库的 `ios-build` 分支（匿名可读），同时上传 Actions artifact（保留 30 天）
-- 取产物：`https://raw.githubusercontent.com/<owner>/FusionRecorder-iOS/ios-build/ci-logs/FusionRecorder-0.2.0-unsigned.ipa`
+- 取产物：`https://raw.githubusercontent.com/<owner>/FusionRecorder-iOS/ios-build/ci-logs/FusionRecorder-0.3.0-unsigned.ipa`
 - 侧载签名：SideStore / AltStore + 免费 Apple ID，7 天续签（交接包 §7 待办 6）
 
 ## 推送与云端编译
@@ -155,10 +180,14 @@ brew install xcodegen && xcodegen generate && open FusionRecorder.xcodeproj
 
 ## 版本
 
-版本号唯一来源是 `project.yml` 的 `MARKETING_VERSION`（当前 `0.1.2`）。改版本只改这一处，workflow 与 IPA 文件名都从它读取。
+版本号唯一来源是 `project.yml` 的 `MARKETING_VERSION`（当前 `0.2.0`）。改版本只改这一处，workflow 与 IPA 文件名都从它读取。
 
 | 版本 | 内容 |
 |---|---|
 | 0.1.0 | 云端编译链路跑通，未签名 IPA 可侧载 |
 | 0.1.1 | 界面按交接包 `activity_main.xml` 复刻，10 条滑杆齐备 |
-| **0.1.2** | 预览换真实帧；预览与录制共用唯一合成器与参数；加入眼镜抓帧 / 相册导入 / 合成帧导出 |
+| 0.1.2 | 预览换真实帧；预览与录制共用唯一合成器与参数；加入眼镜抓帧 / 相册导入 / 合成帧导出 |
+| **0.2.0** | `MovieWriter` 逐帧写 mp4 到相册；SEI pts 解析 + 双路帧队列 + 20fps CFR 对齐；录制完成回调后再弹完成页 |
+
+> 云端编译：commit `5297a911`，run `44054343878`，SDK `iphoneos26.5`，结果 success。
+> Mach-O 已确认编入 `FusionPtsParser` / `MovieWriter` / `AVAssetWriter` / `RecorderSession`。

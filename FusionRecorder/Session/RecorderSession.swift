@@ -69,6 +69,9 @@ final class RecorderSession: ObservableObject {
         recordError = nil
     }
 
+    /// UI 侧追加一条可见日志（保留了时间戳格式）
+    func appendUser(_ line: String) { append(line) }
+
     /// 抓到的真实帧交给它保存，随后自动成为预览源
     weak var frameStore: FrameStore?
 
@@ -76,9 +79,16 @@ final class RecorderSession: ObservableObject {
     private var screenDecoder = H264FrameDecoder()
     private var cameraDecoder = H264FrameDecoder()
 
+    /// 全自动部署编排器（发现 → ADB → push → 启动两路）
+    /// 由 ContentView 注入并共用同一实例，便于 UI 观察状态
+    var orchestrator = CaptureOrchestrator()
+
     private var adb: ADBClient?
     private var screenReceiver: H264StreamReceiver?
     private var cameraReceiver: H264StreamReceiver?
+    /// 全自动模式：采集端主动连 iPhone，用监听端（与上面的客户端并存）
+    private var screenListener: H264StreamListener?
+    private var cameraListener: H264StreamListener?
 
     private var captureScreenReceiver: H264StreamReceiver?
     private var captureCameraReceiver: H264StreamReceiver?
@@ -110,16 +120,56 @@ final class RecorderSession: ObservableObject {
 
     // MARK: - 录制
 
+    /// 手动模式：iPhone 主动连眼镜（眼镜端是 server）。用于老 PoC / 抓帧对照。
     func start(host: String, screenPort: UInt16, cameraPort: UInt16) {
+        beginPipeline(screenPort: screenPort, cameraPort: cameraPort, listen: false, host: host)
+        // 手动模式也尝试 ADB 握手（老流程：只连不部署）
+        let client = ADBClient(host: host, port: 5555)
+        client.log = { [weak self] message in self?.append("[ADB] \(message)") }
+        adb = client
+        client.connect { [weak self] result in
+            switch result {
+            case .success: self?.append("ADB 握手完成")
+            case .failure(let error): self?.append("ADB 连接失败：\(error.localizedDescription)（流仍可单独接收）")
+            }
+        }
+    }
+
+    /// 全自动模式：先部署眼镜端，再让 iPhone 监听 9114/9115 等采集端主动接入。
+    func startAuto(host: String? = nil, screenPort: UInt16 = 9114, cameraPort: UInt16 = 9115,
+                   completion: @escaping (Result<Void, Error>) -> Void) {
+        guard !isRunning else {
+            completion(.failure(ADBError.connectionFailed("正在录制中")))
+            return
+        }
+        append("全自动：发现眼镜 → 部署采集端 → 监听两路 → 录制写相册")
+        orchestrator.run(host: host) { [weak self] result in
+            guard let self = self else { return }
+            switch result {
+            case .failure(let error):
+                completion(.failure(error))
+            case .success(let message):
+                self.append("部署完成：\(message)")
+                // 采集端已下发启动命令，立刻开监听；采集端会主动连过来
+                self.beginPipeline(screenPort: screenPort, cameraPort: cameraPort,
+                                   listen: true, host: nil)
+                completion(.success(()))
+            }
+        }
+    }
+
+    /// 管线公共部分：解码器 / 帧队列 / writer / CFR；两种模式只差接收方式。
+    private func beginPipeline(screenPort: UInt16, cameraPort: UInt16,
+                               listen: Bool, host: String?) {
         guard !isRunning else { return }
         isRunning = true
         livePreview = nil
         finishedMovieURL = nil
         recordError = nil
         recordedFrameCount = 0
-        append("启动：ADB \(host):5555 / 屏幕 \(screenPort) / 相机 \(cameraPort)")
+        append("启动：\(listen ? "监听" : "连接") 屏幕 \(screenPort) / 相机 \(cameraPort)")
         append("合成参数：\(params.fingerprint)")
-        append("v0.2：pts 锚点对齐，\(outputFPS)fps CFR 输出，成片写相册")
+        append("v0.3：pts 锚点对齐，\(outputFPS)fps CFR 输出，成片写相册")
 
         // 成片分辨率 = 合成画布 = 预览画布（三者同一份 FusionParams）
         let size = params.renderSize
@@ -137,17 +187,6 @@ final class RecorderSession: ObservableObject {
             return
         }
 
-        // ADB 只负责启动/授权；视频流不挤进 adb 通道
-        let client = ADBClient(host: host, port: 5555)
-        client.log = { [weak self] message in self?.append("[ADB] \(message)") }
-        adb = client
-        client.connect { [weak self] result in
-            switch result {
-            case .success: self?.append("ADB 握手完成")
-            case .failure(let error): self?.append("ADB 连接失败：\(error.localizedDescription)（流仍可单独接收）")
-            }
-        }
-
         screenDecoder = H264FrameDecoder()
         cameraDecoder = H264FrameDecoder()
         frameLock.lock()
@@ -157,23 +196,40 @@ final class RecorderSession: ObservableObject {
         outputFrameIndex = 0
         frameLock.unlock()
 
-        let screen = H264StreamReceiver(host: host, port: screenPort, label: "screen",
-            onNAL: { [weak self] nal in
-                self?.bumpScreen()
-                self?.handleLive(nal, isScreen: true)
-            },
-            onState: { [weak self] message in self?.append("[屏幕] \(message)") })
-        let camera = H264StreamReceiver(host: host, port: cameraPort, label: "camera",
-            onNAL: { [weak self] nal in
-                self?.bumpCamera()
-                self?.handleLive(nal, isScreen: false)
-            },
-            onState: { [weak self] message in self?.append("[相机] \(message)") })
+        let onScreenNAL: (Data) -> Void = { [weak self] nal in
+            self?.bumpScreen()
+            self?.handleLive(nal, isScreen: true)
+        }
+        let onCameraNAL: (Data) -> Void = { [weak self] nal in
+            self?.bumpCamera()
+            self?.handleLive(nal, isScreen: false)
+        }
 
-        screenReceiver = screen
-        cameraReceiver = camera
-        screen.start()
-        camera.start()
+        if listen {
+            // 全自动：眼镜主动连过来
+            let sl = H264StreamListener(port: screenPort, label: "screen",
+                onNAL: onScreenNAL,
+                onState: { [weak self] message in self?.append("[屏幕/监听] \(message)") })
+            let cl = H264StreamListener(port: cameraPort, label: "camera",
+                onNAL: onCameraNAL,
+                onState: { [weak self] message in self?.append("[相机/监听] \(message)") })
+            screenListener = sl
+            cameraListener = cl
+            sl.start()
+            cl.start()
+        } else if let host = host {
+            // 手动：iPhone 主动连眼镜
+            let screen = H264StreamReceiver(host: host, port: screenPort, label: "screen",
+                onNAL: onScreenNAL,
+                onState: { [weak self] message in self?.append("[屏幕] \(message)") })
+            let camera = H264StreamReceiver(host: host, port: cameraPort, label: "camera",
+                onNAL: onCameraNAL,
+                onState: { [weak self] message in self?.append("[相机] \(message)") })
+            screenReceiver = screen
+            cameraReceiver = camera
+            screen.start()
+            camera.start()
+        }
 
         startCFRTimer()
     }
@@ -185,6 +241,14 @@ final class RecorderSession: ObservableObject {
 
         screenReceiver?.stop()
         cameraReceiver?.stop()
+        screenListener?.stop()
+        cameraListener?.stop()
+        screenListener = nil
+        cameraListener = nil
+        // 通知眼镜端停相机流（屏幕流靠 TCP 断开，心跳最多 1 秒感知）
+        orchestrator.stop { [weak self] in
+            self?.append("已通知眼镜端停止采集")
+        }
         adb?.disconnect()
         screenDecoder.invalidate()
         cameraDecoder.invalidate()

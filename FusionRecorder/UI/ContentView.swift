@@ -23,6 +23,9 @@ import CoreGraphics
 struct ContentView: View {
     @StateObject private var session = RecorderSession()
     @StateObject private var frames = FrameStore()
+    /// 全自动部署编排器（View 持有以观察状态，注入 session 共用同一实例）
+    @StateObject private var orchestrator = CaptureOrchestrator()
+    @State private var autoBusy = false
 
     @State private var showLog = false
     @State private var showRecording = false
@@ -225,6 +228,35 @@ struct ContentView: View {
                     fieldRow("屏幕流端口（9114）", text: $screenPort, decimal: false)
                     fieldRow("相机流端口（9115）", text: $cameraPort, decimal: false)
 
+                    // ---- v0.3：全自动部署（骨架）----
+                    sectionTitle("全自动部署（v0.3 骨架）")
+                    Text("状态：\(orchestrator.stage.rawValue) — \(orchestrator.stageDetail)")
+                        .font(.system(size: 11))
+                        .foregroundStyle(orchestrator.stage == .failed ? Palette.danger : Palette.section)
+                    HStack(spacing: 8) {
+                        smallButton(orchestrator.isBusy ? "部署中…" : "① 自动部署采集端") {
+                            autoDeploy()
+                        }
+                        smallButton(orchestrator.isBusy ? "请稍候" : "② 全自动录制") {
+                            autoRecord()
+                        }
+                    }
+                    .padding(.top, 6)
+                    Text("① 只装好眼镜端（自动扫 5555 → ADB 授权 → push → 启动两路）；② 部署完直接开录。眼镜 IP 留上面字段为空则自动扫描。首次 ADB 需在眼镜上点「允许调试」。")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Palette.hint)
+                        .padding(.top, 4)
+                    if !orchestrator.log.isEmpty {
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text("部署日志：").font(.system(size: 11, design: .monospaced))
+                            ForEach(orchestrator.log.suffix(8), id: \.self) { line in
+                                Text(line).font(.system(size: 10, design: .monospaced))
+                            }
+                        }
+                        .foregroundStyle(Palette.danger)
+                        .padding(.top, 6)
+                    }
+
                     sectionTitle("叠加效果")
                     sliderRow("屏幕透明度", value: $alpha, range: 0.0...1.0)
                     sliderRow("屏幕占比", value: $scale, range: 0.2...0.95)
@@ -277,6 +309,7 @@ struct ContentView: View {
         .preferredColorScheme(.dark)
         .onAppear {
             session.frameStore = frames
+            session.orchestrator = orchestrator
             session.update(params: fusionParams)
         }
         .onChange(of: fusionParams) { newValue in
@@ -433,6 +466,39 @@ struct ContentView: View {
             DispatchQueue.main.async {
                 saveNote = success ? "当前合成帧已保存到相册，可与成片逐帧比对"
                                   : "保存失败：\(error?.localizedDescription ?? "无权限")"
+            }
+        }
+    }
+
+    private func autoDeploy() {
+        guard !autoBusy else { return }
+        autoBusy = true
+        let given = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        orchestrator.run(host: given.isEmpty ? nil : given) { [weak self] result in
+            DispatchQueue.main.async {
+                self?.autoBusy = false
+            }
+        }
+    }
+
+    private func autoRecord() {
+        guard !autoBusy, !session.isRunning else { return }
+        autoBusy = true
+        session.clearRecordResult()
+        session.update(params: fusionParams)
+        let given = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        session.startAuto(host: given.isEmpty ? nil : given,
+                          screenPort: UInt16(screenPort) ?? 9114,
+                          cameraPort: UInt16(cameraPort) ?? 9115) { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.autoBusy = false
+                switch result {
+                case .success:
+                    self.showRecording = true
+                case .failure(let error):
+                    self.session.appendUser("全自动启动失败：\(error.localizedDescription)")
+                }
             }
         }
     }

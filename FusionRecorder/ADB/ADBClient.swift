@@ -2,26 +2,29 @@
 //  ADBClient.swift
 //  FusionRecorder
 //
-//  轻量 ADB client（无线 ADB 只用来启动采集 / push server / 保活，视频流不挤进 adb）。
+//  轻量 ADB client：无线 ADB 只用来启动采集 / push jar / 保活，视频流不挤进 adb。
 //
-//  v0.1 已实现：CNXN / AUTH / OPEN / WRTE / OKAY / CLSE 帧状态机、TCP 收发、shell。
-//  TODO(v0.2)：RSA 密钥持久化 + AUTH_SIGNATURE 回复 token；首次连接改发
-//              AUTH_PUBLICKEY 让眼镜弹「允许调试」。不同 ROM 的授权界面表现不同，
-//              需真机联调后定，见交接包 §7 待办 2。
+//  协议帧：CNXN / AUTH / OPEN / WRTE / OKAY / CLSE（见 ADBPacket.swift）。
+//  v0.3 骨架把能离线写完的部分全部写实：
+//   · AUTH 状态机：第 1 轮回 SIGNATURE（已授权过直接放行），第 2 轮起回 PUBLICKEY（弹授权框）
+//   · 通用 stream：shell: 与 sync: 共用一套 OPEN/WRTE/CLSE 多路复用
+//   · sync push：按 AOSP SYNC.TXT 构造 SEND/DATA/DONE，把 APK/JAR 推到眼镜
+//  真机唯一待联调：该 ROM 的授权框在收到 PUBLICKEY 后是否如标准 ADB 弹出。
 //
 
 import Foundation
 import Network
-import Security
 
 enum ADBError: Error, LocalizedError {
     case connectionFailed(String)
     case notConnected
+    case timeout
 
     var errorDescription: String? {
         switch self {
         case .connectionFailed(let message): return message
         case .notConnected: return "ADB 连接尚未就绪"
+        case .timeout: return "ADB 操作超时"
         }
     }
 }
@@ -30,14 +33,26 @@ final class ADBClient {
     /// 日志回传（UI 侧负责切主线程）
     var log: ((String) -> Void)?
 
+    private final class Stream {
+        let service: String
+        var remoteId: UInt32?
+        var received = Data()
+        var onOpened: ((UInt32) -> Void)?
+        var onData: ((UInt32, Data) -> Void)?
+        var onClose: ((UInt32, Data) -> Void)?
+        var timer: DispatchSourceTimer?
+        init(_ service: String) { self.service = service }
+    }
+
     private let connection: NWConnection
     private let queue = DispatchQueue(label: "com.lath.fusionrecorder.adb")
     private var buffer = Data()
     private var isReady = false
     private var connectHandlers: [(Result<Void, Error>) -> Void] = []
-    private var shellHandlers: [UInt32: (Result<String, Error>) -> Void] = [:]
+    private var streams: [UInt32: Stream] = [:]
     private var nextLocalId: UInt32 = 0x10000001
-    private var privateKey: SecKey?
+    private var authRound = 0
+    private let finishLock = NSLock()
 
     init(host: String, port: UInt16 = 5555) {
         let nwPort = NWEndpoint.Port(rawValue: port) ?? NWEndpoint.Port(rawValue: 5555)!
@@ -45,9 +60,10 @@ final class ADBClient {
         connection = NWConnection(to: endpoint, using: .tcp)
     }
 
+    // MARK: - 连接
+
     func connect(completion: @escaping (Result<Void, Error>) -> Void) {
         queue.sync { connectHandlers.append(completion) }
-
         connection.stateUpdateHandler = { [weak self] state in
             guard let self = self else { return }
             switch state {
@@ -69,35 +85,136 @@ final class ADBClient {
         connection.cancel()
     }
 
-    func shell(_ command: String, completion: @escaping (Result<String, Error>) -> Void) {
-        queue.async {
-            guard self.isReady else {
-                completion(.failure(ADBError.notConnected))
-                return
-            }
-            let localId = self.nextLocalId
-            self.nextLocalId &+= 1
-            self.shellHandlers[localId] = completion
-            var payload = Data("shell:\(command)".utf8)
-            payload.append(0)
-            self.send(ADBPacket(command: ADBPacket.OPEN, arg0: localId, arg1: 0, payload: payload))
-        }
-    }
-
-    /// 预先准备 RSA 密钥对（认证真正用起来在 v0.2）
+    /// 预先准备密钥（UI 显示指纹用；认证真正用起来在 handleAuthToken）
     @discardableResult
-    func ensureKeyPair() -> Bool {
-        if privateKey != nil { return true }
-        let attributes: [String: Any] = [
-            kSecAttrKeyType as String: kSecAttrKeyTypeRSA,
-            kSecAttrKeySizeInBits as String: 2048
-        ]
-        var error: Unmanaged<CFError>?
-        privateKey = SecKeyCreateRandomKey(attributes as CFDictionary, &error)
-        return privateKey != nil
+    func ensureKeyPair() -> Bool { ADBAuth.shared.hasKey }
+
+    // MARK: - shell
+
+    /// 执行一条 shell 命令，收集所有 WRTE 输出，CLSE 时回调一次完整字符串。
+    func shell(_ command: String, timeout: TimeInterval = 15,
+               completion: @escaping (Result<String, Error>) -> Void) {
+        open(service: "shell:\(command)", timeout: timeout,
+             onOpened: nil,
+             onData: nil,
+             onClose: { _, output in
+                 completion(.success(String(decoding: output, as: UTF8.self)))
+             },
+             onTimeout: { completion(.failure(ADBError.timeout)) })
     }
 
-    // MARK: - 私有
+    /// 启动一个长期运行的命令（屏幕流 sec=0 永不返回）。
+    /// OPEN 成功即回调，之后收到的数据只记日志；直到 disconnect 才结束。
+    func shellDetached(_ command: String, completion: @escaping (Result<Void, Error>) -> Void) {
+        guard isReady else { completion(.failure(ADBError.notConnected)); return }
+        open(service: "shell:\(command)", timeout: 0,
+             onOpened: { _ in completion(.success(())) },
+             onData: { [weak self] _, chunk in
+                 let text = String(decoding: chunk, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+                 if !text.isEmpty { self?.log?("[detached] \(text)") }
+             },
+             onClose: { [weak self] _, _ in
+                 self?.log?("[detached] 通道已关闭")
+             },
+             onTimeout: nil)
+    }
+
+    // MARK: - sync push
+
+    /// 把本地文件字节推到设备。path 用绝对路径，mode 如 0644。
+    func push(path: String, data: Data, mode: UInt32 = 0o644,
+              timeout: TimeInterval = 30,
+              completion: @escaping (Result<Void, Error>) -> Void) {
+        let frames = ADBSyncPusher.sendFrames(
+            path: path, mode: mode, data: data,
+            mtime: UInt32(Date().timeIntervalSince1970))
+        var finished = false
+        let finish: (Result<Void, Error>) -> Void = { [weak self] result in
+            guard let self = self else { return }
+            self.finishLock.lock()
+            if finished { self.finishLock.unlock(); return }
+            finished = true
+            self.finishLock.unlock()
+            DispatchQueue.main.async { completion(result) }
+        }
+
+        open(service: "sync:", timeout: timeout,
+             onOpened: { [weak self] localId in
+                 guard let self = self else { return }
+                 for frame in frames { self.write(localId, frame) }
+             },
+             onData: { [weak self] localId, chunk in
+                 guard let self = self else { return }
+                 self.syncBuffer.append(chunk)
+                 while let parsed = ADBSyncPusher.parseResponse(self.syncBuffer) {
+                     self.syncBuffer.removeSubrange(0..<parsed.consumed)
+                     switch parsed.result {
+                     case .success:
+                         finish(.success(()))
+                         self.closeStream(localId)
+                     case .failure(let error):
+                         finish(.failure(error))
+                         self.closeStream(localId)
+                     }
+                 }
+             },
+             onClose: { _, _ in
+                 finish(.failure(ADBError.connectionFailed("sync 通道提前关闭")))
+             },
+             onTimeout: { finish(.failure(ADBError.timeout)) })
+    }
+
+    private var syncBuffer = Data()
+
+    // MARK: - 通用 stream
+
+    @discardableResult
+    private func open(service: String, timeout: TimeInterval,
+                      onOpened: ((UInt32) -> Void)?,
+                      onData: ((UInt32, Data) -> Void)?,
+                      onClose: ((UInt32, Data) -> Void)?,
+                      onTimeout: (() -> Void)?) -> UInt32? {
+        guard isReady else { return nil }
+        let localId = nextLocalId
+        nextLocalId &+= 1
+        let stream = Stream(service)
+        stream.onOpened = onOpened
+        stream.onData = onData
+        stream.onClose = onClose
+        streams[localId] = stream
+
+        if timeout > 0 {
+            let timer = DispatchSource.makeTimerSource(queue: queue)
+            timer.schedule(deadline: .now() + timeout)
+            timer.setEventHandler { [weak self] in
+                guard let self = self, let stream = self.streams[localId] else { return }
+                self.streams.removeValue(forKey: localId)
+                stream.timer?.cancel()
+                onTimeout?()
+            }
+            timer.resume()
+            stream.timer = timer
+        }
+
+        var payload = Data(service.utf8)
+        payload.append(0)
+        send(ADBPacket(command: ADBPacket.OPEN, arg0: localId, arg1: 0, payload: payload))
+        return localId
+    }
+
+    private func write(_ localId: UInt32, _ payload: Data) {
+        guard let stream = streams[localId], let remoteId = stream.remoteId else { return }
+        send(ADBPacket(command: ADBPacket.WRTE, arg0: localId, arg1: remoteId, payload: payload))
+    }
+
+    private func closeStream(_ localId: UInt32) {
+        guard let stream = streams.removeValue(forKey: localId) else { return }
+        stream.timer?.cancel()
+        let remoteId = stream.remoteId ?? 0
+        send(ADBPacket(command: ADBPacket.CLSE, arg0: localId, arg1: remoteId))
+    }
+
+    // MARK: - 底层收发
 
     private func send(_ packet: ADBPacket) {
         let data = packet.encoded()
@@ -111,7 +228,6 @@ final class ADBClient {
     private func sendCNXN() {
         var payload = Data(ADBPacket.systemIdentity.utf8)
         payload.append(0)
-        // version = 0x01000000, maxdata = 1 MiB
         send(ADBPacket(command: ADBPacket.CNXN, arg0: 0x01000000, arg1: 0x00100000, payload: payload))
     }
 
@@ -151,19 +267,27 @@ final class ADBClient {
             resolveConnect(.success(()))
 
         case ADBPacket.OKAY:
-            log?("stream \(packet.arg1) 已就绪")
+            // OPEN 的确认：arg0 = 客户端 localId，arg1 = 设备 remoteId
+            if let stream = streams[packet.arg0], stream.remoteId == nil {
+                stream.remoteId = packet.arg1
+                log?("stream \(packet.arg1) 已就绪 (\(stream.service))")
+                stream.onOpened?(packet.arg0)
+            }
 
         case ADBPacket.WRTE:
             let localId = packet.arg1
-            if let text = String(data: packet.payload, encoding: .utf8), !text.isEmpty {
-                shellHandlers[localId]?(.success(text))
+            if let stream = streams[localId] {
+                stream.received.append(packet.payload)
+                stream.onData?(localId, packet.payload)
             }
             send(ADBPacket(command: ADBPacket.OKAY, arg0: packet.arg1, arg1: packet.arg0))
 
         case ADBPacket.CLSE:
-            if packet.arg1 != 0 {
-                send(ADBPacket(command: ADBPacket.CLSE, arg0: packet.arg1, arg1: packet.arg0))
-                shellHandlers.removeValue(forKey: packet.arg1)?(.success(""))
+            let localId = packet.arg1
+            if let stream = streams.removeValue(forKey: localId) {
+                stream.timer?.cancel()
+                send(ADBPacket(command: ADBPacket.CLSE, arg0: localId, arg1: stream.remoteId ?? 0))
+                stream.onClose?(localId, stream.received)
             }
 
         default:
@@ -172,11 +296,18 @@ final class ADBClient {
     }
 
     private func handleAuthToken(_ token: Data) {
-        // TODO(v0.2)：用 ensureKeyPair() 的私钥签名 token 后回 AUTH(authSignature)，
-        // 或首次连接发 AUTH(authPublicKey) 让设备弹授权框。这里先只记录，
-        // 不发无效帧，避免握手被毒化；真机联调时按 ROM 行为补齐。
-        log?("收到 AUTH TOKEN（\(token.count) 字节），RSA 认证待接入")
-        _ = ensureKeyPair()
+        authRound += 1
+        if authRound == 1, let signature = ADBAuth.shared.signature(for: token) {
+            // 已授权过：设备认这个签名就直接回 CNXN
+            log?("AUTH 第 1 轮：回 SIGNATURE（\(signature.count) 字节）")
+            send(ADBPacket(command: ADBPacket.AUTH, arg0: ADBPacket.authSignature, payload: signature))
+        } else if let publicKey = ADBAuth.shared.publicKeyPayload() {
+            // 首次连接 / 签名未被接受：回公钥，让设备弹「允许 USB/Wi-Fi 调试」
+            log?("AUTH 第 \(authRound) 轮：回 PUBLICKEY（等待设备授权框）")
+            send(ADBPacket(command: ADBPacket.AUTH, arg0: ADBPacket.authPublicKey, payload: publicKey))
+        } else {
+            log?("AUTH：密钥未就绪，等待真机联调")
+        }
     }
 
     private func resolveConnect(_ result: Result<Void, Error>) {
