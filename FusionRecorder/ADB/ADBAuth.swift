@@ -86,9 +86,9 @@ final class ADBAuth {
     /// payload = base64(SPKI DER) + " fusion@iphone"。
     /// 设备端把它当作 adb_keys 的一行：base64 部分是指纹，后面是注释。
     func publicKeyPayload() -> Data? {
-        guard let key = privateKey, let public = SecKeyCopyPublicKey(key) else { return nil }
+        guard let key = privateKey, let pubKey = SecKeyCopyPublicKey(key) else { return nil }
         var error: Unmanaged<CFError>?
-        guard let der = SecKeyCopyExternalRepresentation(public, &error) as Data? else {
+        guard let der = SecKeyCopyExternalRepresentation(pubKey, &error) as Data? else {
             NSLog("[ADBAuth] 导出公钥失败: \(String(describing: error))")
             return nil
         }
@@ -98,9 +98,9 @@ final class ADBAuth {
 
     /// 指纹用于 UI 显示，方便用户核对设备 adb_keys 里多出来的那一行。
     var fingerprint: String {
-        guard let key = privateKey, let public = SecKeyCopyPublicKey(key),
-              let der = SecKeyCopyExternalRepresentation(public, nil) as Data? else { return "未生成" }
-        return der.base64EncodedString().prefix(16) + "…"
+        guard let key = privateKey, let pubKey = SecKeyCopyPublicKey(key),
+              let der = SecKeyCopyExternalRepresentation(pubKey, nil) as Data? else { return "未生成" }
+        return String(der.base64EncodedString().prefix(16)) + "…"
     }
 
     /// 真机联调时的排错口：清掉 Keychain 里的密钥（下次连接重新生成+重新授权）。

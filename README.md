@@ -180,14 +180,15 @@ brew install xcodegen && xcodegen generate && open FusionRecorder.xcodeproj
 
 ## 版本
 
-版本号唯一来源是 `project.yml` 的 `MARKETING_VERSION`（当前 `0.2.0`）。改版本只改这一处，workflow 与 IPA 文件名都从它读取。
+版本号唯一来源是 `project.yml` 的 `MARKETING_VERSION`（当前 `0.3.0`）。改版本只改这一处，workflow 与 IPA 文件名都从它读取。
 
 | 版本 | 内容 |
 |---|---|
 | 0.1.0 | 云端编译链路跑通，未签名 IPA 可侧载 |
 | 0.1.1 | 界面按交接包 `activity_main.xml` 复刻，10 条滑杆齐备 |
 | 0.1.2 | 预览换真实帧；预览与录制共用唯一合成器与参数；加入眼镜抓帧 / 相册导入 / 合成帧导出 |
-| **0.2.0** | `MovieWriter` 逐帧写 mp4 到相册；SEI pts 解析 + 双路帧队列 + 20fps CFR 对齐；录制完成回调后再弹完成页 |
+| 0.2.0 | `MovieWriter` 逐帧写 mp4 到相册；SEI pts 解析 + 双路帧队列 + 20fps CFR 对齐；录制完成回调后再弹完成页 |
+| **0.3.0** | ADB 自动化骨架（网段发现 / RSA AUTH / sync push / 命令状态机）+ 全自动监听接收；采集端 APK/JAR 打进 IPA；`adb_autotest.py` 离线自测 3/3 |
 
 > 云端编译：commit `5297a911`，run `44054343878`，SDK `iphoneos26.5`，结果 success。
 > Mach-O 已确认编入 `FusionPtsParser` / `MovieWriter` / `AVAssetWriter` / `RecorderSession`。
