@@ -35,7 +35,7 @@ struct ADBPacket {
         return value
     }
 
-    init(command: UInt32, arg0: UInt32, arg1: UInt32, payload: Data = Data()) {
+    init(command: UInt32, arg0: UInt32, arg1: UInt32 = 0, payload: Data = Data()) {
         self.command = command
         self.arg0 = arg0
         self.arg1 = arg1

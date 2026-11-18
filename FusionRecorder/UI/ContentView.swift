@@ -474,9 +474,9 @@ struct ContentView: View {
         guard !autoBusy else { return }
         autoBusy = true
         let given = host.trimmingCharacters(in: .whitespacesAndNewlines)
-        orchestrator.run(host: given.isEmpty ? nil : given) { [weak self] result in
+        orchestrator.run(host: given.isEmpty ? nil : given) { [self] result in
             DispatchQueue.main.async {
-                self?.autoBusy = false
+                self.autoBusy = false
             }
         }
     }
@@ -489,9 +489,8 @@ struct ContentView: View {
         let given = host.trimmingCharacters(in: .whitespacesAndNewlines)
         session.startAuto(host: given.isEmpty ? nil : given,
                           screenPort: UInt16(screenPort) ?? 9114,
-                          cameraPort: UInt16(cameraPort) ?? 9115) { [weak self] result in
+                          cameraPort: UInt16(cameraPort) ?? 9115) { [self] result in
             DispatchQueue.main.async {
-                guard let self = self else { return }
                 self.autoBusy = false
                 switch result {
                 case .success:
