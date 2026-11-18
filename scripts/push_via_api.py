@@ -128,6 +128,10 @@ def main():
     # 6) 确保默认分支是 main（否则 on: push branches:[main] 不触发）
     req("PATCH", BASE, {"default_branch": "main"})
 
+    # 把本次 commit sha 落盘，供 cloud_build.sh 精确匹配对应的 Actions run
+    # （GitHub runs 列表有延迟，用 per_page=1 会误读到上一次的旧 run）
+    sha_file = ROOT / ".last_commit_sha"
+    sha_file.write_text(commit_sha)
     print(f"已{action} main: {commit_sha[:12]}（{len(files)} 个文件，单次提交）")
 
 

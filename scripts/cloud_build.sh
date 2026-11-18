@@ -16,6 +16,8 @@ PY="${PYTHON:-python3}"
 
 say() { printf '\n==> %s\n' "$*"; }
 auth() { curl -sS -H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/vnd.github+json" "$@"; }
+# 供需要多参数 curl 的场景（下载 run 日志 zip）复用同一组认证头
+CURL_AUTH=(-H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/vnd.github+json")
 
 say "读取 GitHub 账号"
 OWNER=$(auth "$API/user" | "$PY" -c 'import sys,json; print(json.load(sys.stdin).get("login") or "")')
@@ -63,26 +65,52 @@ git commit -qm "feat: FusionRecorder-iOS v0.2 工程 + 云端编译 workflow" ||
 # 沙箱里 github.com:443 的 git smart HTTP 不可达，改用 api.github.com
 "$PY" scripts/push_via_api.py "$OWNER" "$REPO" "$ROOT"
 
-say "确认 workflow 已被触发（没有则手动 dispatch 兜底）"
-RUNS="$API/repos/$OWNER/$REPO/actions/runs?per_page=1"
+say "确认 workflow 已被触发（按本次 commit sha 精确匹配，避免误读旧 run）"
+TARGET_SHA="$(cat "$ROOT/.last_commit_sha" 2>/dev/null || echo "")"
+if [ -z "$TARGET_SHA" ]; then echo "!! 读不到本次 commit sha"; exit 1; fi
+echo "目标 commit: ${TARGET_SHA:0:12}"
+
+# 找到 head_sha == TARGET_SHA 的 run；runs 列表有延迟，最多等 120s
+RUN_ID=""
 WAITED=0
-while [ "$WAITED" -lt 90 ]; do
-  N=$(auth "$RUNS" | "$PY" -c 'import sys,json; print(len(json.load(sys.stdin).get("workflow_runs",[])))' 2>/dev/null || echo 0)
-  if [ "$N" != "0" ] && [ -n "$N" ]; then echo "已检测到 workflow run（等待 ${WAITED}s）"; break; fi
+while [ "$WAITED" -lt 120 ]; do
+  RUN_ID=$(auth "$API/repos/$OWNER/$REPO/actions/runs?per_page=10" | "$PY" -c '
+import sys, json
+target = sys.argv[1]
+try:
+    runs = json.load(sys.stdin).get("workflow_runs", [])
+except Exception:
+    runs = []
+for r in runs:
+    if r.get("head_sha") == target:
+        print(r["id"]); break
+' "$TARGET_SHA" 2>/dev/null || echo "")
+  if [ -n "$RUN_ID" ]; then echo "已检测到本次 commit 的 run: $RUN_ID（等待 ${WAITED}s）"; break; fi
   sleep 10; WAITED=$((WAITED + 10))
 done
-if [ "${N:-0}" = "0" ] || [ -z "${N:-}" ]; then
-  echo "未检测到 push 触发的 run，尝试 workflow_dispatch"
+if [ -z "$RUN_ID" ]; then
+  echo "push 未触发 run，尝试 workflow_dispatch 后重新匹配"
   DC=$(auth -o /tmp/fusion_dispatch.json -w "%{http_code}" -X POST \
     -H "Content-Type: application/json" \
     "$API/repos/$OWNER/$REPO/actions/workflows/build-ipa.yml/dispatches" \
-    -d '{"ref":"main"}')
+    -d "{\"ref\":\"main\"}")
   echo "dispatch HTTP $DC"
-  if [ "$DC" != "204" ]; then
-    echo "!! 既没有 push 触发、dispatch 也失败（HTTP $DC）"; cat /tmp/fusion_dispatch.json
-    echo "   请在仓库页面手动 Run workflow：https://github.com/$OWNER/$REPO/actions/workflows/build-ipa.yml"
-    exit 1
-  fi
+  [ "$DC" != "204" ] && { echo "!! dispatch 失败（HTTP $DC）"; cat /tmp/fusion_dispatch.json; exit 1; }
+  WAITED=0
+  while [ "$WAITED" -lt 120 ]; do
+    RUN_ID=$(auth "$API/repos/$OWNER/$REPO/actions/runs?per_page=10" | "$PY" -c '
+import sys, json
+target = sys.argv[1]
+try: runs = json.load(sys.stdin).get("workflow_runs", [])
+except Exception: runs = []
+for r in runs:
+    if r.get("head_sha") == target:
+        print(r["id"]); break
+' "$TARGET_SHA" 2>/dev/null || echo "")
+    [ -n "$RUN_ID" ] && { echo "dispatch 后检测到 run: $RUN_ID"; break; }
+    sleep 10; WAITED=$((WAITED + 10))
+  done
+  [ -z "$RUN_ID" ] && { echo "!! 仍找不到本次 commit 的 run"; exit 1; }
 fi
 
 say "等待 GitHub Actions 编译（最长 ${POLL_TIMEOUT}s）"
@@ -90,27 +118,26 @@ DEADLINE=$(( $(date +%s) + POLL_TIMEOUT ))
 LAST=""
 FINISHED=0
 while [ "$(date +%s)" -lt "$DEADLINE" ]; do
-  RESP=$(auth "$RUNS")
+  # 直接查本次 run，绝不读 runs?per_page=1（会拿到旧 run 的过期状态/错误）
+  RESP=$(auth "$API/repos/$OWNER/$REPO/actions/runs/$RUN_ID")
   STATE=$(printf '%s' "$RESP" | "$PY" -c '
 import sys, json
 d = json.load(sys.stdin)
-runs = d.get("workflow_runs", [])
-if not runs:
-    print("waiting|no-run|0|")
-else:
-    r = runs[0]
-    print("%s|%s|%s|%s" % (r.get("status"), r.get("conclusion") or "pending", r.get("id"), r.get("head_sha","")[:8]))
+print("%s|%s|%s|%s" % (d.get("status"), d.get("conclusion") or "pending", d.get("id"), d.get("head_sha","")[:8]))
 ' 2>/dev/null || echo "waiting|parse-error|0|")
   if [ "$STATE" != "$LAST" ]; then echo "  状态: $STATE"; LAST="$STATE"; fi
   STATUS="${STATE%%|*}"; REST="${STATE#*|}"; CONCLUSION="${REST%%|*}"
   if [ "$STATUS" = "completed" ]; then
     FINISHED=1
     if [ "$CONCLUSION" = "success" ]; then echo "云端编译成功"; break; fi
-    echo "!! 构建失败 ($CONCLUSION)，错误摘要："
-    curl -sS "https://raw.githubusercontent.com/$OWNER/$REPO/ios-build/ci-logs/errors.txt" | head -60 || true
-    echo
-    RUNID=$(printf '%s' "$STATE" | cut -d'|' -f3)
-    echo "完整日志: https://github.com/$OWNER/$REPO/actions/runs/$RUNID"
+    echo "!! 构建失败 ($CONCLUSION)"
+    echo "   从本次 run 的真实日志提取错误（不用 ios-build 上可能过期的 errors.txt）："
+    cd /tmp && rm -rf fusion_run_logs && mkdir fusion_run_logs && cd fusion_run_logs
+    curl -sSL "${CURL_AUTH[@]}" -o logs.zip "$API/repos/$OWNER/$REPO/actions/runs/$RUN_ID/logs" 2>/dev/null || true
+    unzip -q -o logs.zip 2>/dev/null || true
+    grep -rhE "error:|BUILD FAILED" . 2>/dev/null | grep -v "grep -E" | sort -u | head -30 || true
+    cd "$ROOT"
+    echo "完整日志: https://github.com/$OWNER/$REPO/actions/runs/$RUN_ID"
     exit 1
   fi
   sleep 15
