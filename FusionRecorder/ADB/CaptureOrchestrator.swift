@@ -9,9 +9,9 @@
 //
 //  ★ 关键方向（容易搞反）：启动命令里的 host 是【iPhone 的 IP】，
 //    因为采集端主动连 iPhone 的监听端口；不是眼镜自己的 IP。
-//  ★ 接收端必须处于监听姿态才能对上这个方向。当前 H264StreamReceiver 是
-//    客户端（iPhone 主动连眼镜），与采集端方向相反，需在全自动联调时切到
-//    NWListener 监听模式——这一步属接收层，不在本骨架内，见 README「已知边界」。
+//  ★ 接收端必须处于监听姿态才能对上这个方向。v0.3 已提供 H264StreamListener
+//    （NWListener 服务端）；RecorderSession.startAuto 走监听，手动抓帧仍走
+//    H264StreamReceiver（客户端），两者并存、共用 H264NALSplitter。
 //
 //  真机待联调的唯一项：ROM 在收到 AUTH_PUBLICKEY 后是否弹授权框（ADBAuth 已按标准实现）。
 //

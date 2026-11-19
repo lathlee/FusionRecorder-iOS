@@ -55,8 +55,10 @@ def req(method, path, payload=None, timeout=60):
 
 def main():
     # 1) 文件清单以本地 git 索引为准（.gitignore 已排除生成物）
+    # core.quotepath=false：避免中文文件名被 git 转义成 "\347\234..." 八进制串，
+    # 否则 push 时按转义串去找本地文件会 FileNotFoundError。
     files = subprocess.check_output(
-        ["git", "ls-files"], cwd=str(ROOT), text=True
+        ["git", "-c", "core.quotepath=false", "ls-files"], cwd=str(ROOT), text=True
     ).splitlines()
     if not files:
         sys.exit("没有可推送的文件")
