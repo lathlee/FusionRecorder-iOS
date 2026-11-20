@@ -33,8 +33,10 @@ settings:
     # 0.4.2 = 拉取链路修正：RECV 结束帧是 DONE 不是 OKAY（否则 pull 永远等不到完成）/
     #         Data 切片按 startIndex 取偏移（DENT 的 size 会读错）/ 拉取改空闲超时 /
     #         录制前把屏幕叫醒并保持常亮（屏幕路没帧就录不出东西）
-    MARKETING_VERSION: "0.4.2"
-    CURRENT_PROJECT_VERSION: "13"
+    # 0.4.3 = 「点开始录制没反应」：复用部署那条已授权连接（第二条连接会卡在 AUTH/CNXN 之后）/
+    #         push 后校验远端字节数 / pm install 失败判定补 Exception / 所有静默 return 都打日志
+    MARKETING_VERSION: "0.4.3"
+    CURRENT_PROJECT_VERSION: "14"
     # 侧载不需要 Apple 签名，签名交给 SideStore / AltStore 用免费 Apple ID 做
     CODE_SIGNING_ALLOWED: "NO"
     CODE_SIGNING_REQUIRED: "NO"

@@ -39,7 +39,9 @@ final class CaptureOrchestrator: ObservableObject {
     @Published private(set) var glassesIP: String?
     @Published private(set) var iphoneIP: String?
 
-    private var adb: ADBClient?
+    /// 已授权的那条 ADB 连接（部署完成后 RecorderSession 直接复用，
+    /// 不再另开第二条 —— 真机上第二条连接经常卡在 AUTH/PUBLICKEY 上不返回）。
+    private(set) var adb: ADBClient?
     private var deploymentOnly = false
 
     // MARK: - 命令构造（静态，便于离线对拍）
@@ -270,11 +272,45 @@ final class CaptureOrchestrator: ObservableObject {
                 case .failure(let error):
                     self.finishFailure("push APK 失败：\(error.localizedDescription)", completion: completion)
                 case .success:
-                    self.append("fusion-capture.apk 已推送（\(apkData.count) 字节）")
-                    self.installAndGrant(client: client, phoneIP: phoneIP, completion: completion)
+                    self.append("fusion-capture.apk 已推送（\(apkData.count) 字节），校验远端大小…")
+                    // ★ 真机踩过：push 回调返回成功，但眼镜上根本没有这个文件，
+                    // 随后 pm install 报 "Can't open file"。所以必须落地校验一次。
+                    client.shell(Self.verifyAssetsCommand(jarBytes: jarData.count,
+                                                          apkBytes: apkData.count),
+                                 timeout: 20) { verifyResult in
+                        let text = (try? verifyResult.get())?
+                            .trimmingCharacters(in: .whitespacesAndNewlines) ?? "（无输出）"
+                        self.append("远端校验：\(text)")
+                        guard text.contains("OK") else {
+                            self.finishFailure("采集端文件没落到眼镜上（\(text)）：sync push 未生效",
+                                               completion: completion)
+                            return
+                        }
+                        self.installAndGrant(client: client, phoneIP: phoneIP, completion: completion)
+                    }
                 }
             }
         }
+    }
+
+    /// 校验 push 是否真的落地（字节数一致才算 OK）
+    static func verifyAssetsCommand(jarBytes: Int, apkBytes: Int) -> String {
+        let j = screenPushPath()
+        let a = apkPushPath()
+        return "j=$(stat -c %s \(j) 2>/dev/null || echo 0); "
+            + "a=$(stat -c %s \(a) 2>/dev/null || echo 0); "
+            + "if [ \"$j\" = \"\(jarBytes)\" ] && [ \"$a\" = \"\(apkBytes)\" ]; "
+            + "then echo OK jar=$j apk=$a; "
+            + "else echo BAD jar=$j/\(jarBytes) apk=$a/\(apkBytes); fi"
+    }
+
+    /// 安装结果判定：`pm install` 失败时是往 stdout 打 "Exception:"，
+    /// 老逻辑只查 "failure" 关键字，会把失败当成功（真机 16:31 就是这样）。
+    static func installLooksFailed(_ text: String) -> Bool {
+        let lower = text.lowercased()
+        return lower.contains("failure") || lower.contains("exception")
+            || lower.contains("error") || lower.contains("can't open file")
+            || !lower.contains("success")
     }
 
     private func installAndGrant(client: ADBClient, phoneIP: String,
@@ -289,7 +325,7 @@ final class CaptureOrchestrator: ObservableObject {
             case .success(let output):
                 let text = output.trimmingCharacters(in: .whitespacesAndNewlines)
                 self.append("安装输出：\(text)")
-                if text.lowercased().contains("failure") {
+                if Self.installLooksFailed(text) {
                     self.finishFailure("安装失败：\(text)", completion: completion)
                     return
                 }
@@ -300,12 +336,22 @@ final class CaptureOrchestrator: ObservableObject {
                 switch grantResult {
                 case .failure(let error):
                     self.finishFailure("授权相机失败：\(error.localizedDescription)", completion: completion)
-                case .success:
-                    self.append("CAMERA 权限已授予")
-                    // 0.4.0：部署阶段只负责把采集端装好。启动本地录制、停止、
-                    // ADB pull 都由 RecorderSession 用自己那条连接完成，
-                    // 不再按 0.3.x 的方式启动实时推流（9114/9115）。
-                    self.finishSuccess("采集端已部署（离线录制模式）", completion: completion)
+                case .success(let grantOut):
+                    self.append("CAMERA 权限已授予 \(grantOut.trimmingCharacters(in: .whitespacesAndNewlines))")
+                    // 落地确认：包真的装上了才算部署完成
+                    client.shell("pm path com.fusion.capture") { pathResult in
+                        let path = (try? pathResult.get())?
+                            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                        guard path.contains("package:") else {
+                            self.finishFailure("采集端没装上（pm path 为空）：\(path)", completion: completion)
+                            return
+                        }
+                        self.append("已确认安装：\(path)")
+                        // 0.4.0：部署阶段只负责把采集端装好。启动本地录制、停止、
+                        // ADB pull 都由 RecorderSession 复用这条已授权的连接完成，
+                        // 不再按 0.3.x 的方式启动实时推流（9114/9115）。
+                        self.finishSuccess("采集端已部署（离线录制模式）", completion: completion)
+                    }
                 }
             }
         }

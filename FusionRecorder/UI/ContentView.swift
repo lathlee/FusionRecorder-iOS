@@ -444,7 +444,10 @@ struct ContentView: View {
     }
 
     private func autoDeploy() {
-        guard !autoBusy else { return }
+        guard !autoBusy else {
+            session.appendUser("部署流程还在执行中，请稍等")
+            return
+        }
         autoBusy = true
         let given = host.trimmingCharacters(in: .whitespacesAndNewlines)
         let localIP = iphoneHostIP.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -452,17 +455,30 @@ struct ContentView: View {
                          iphoneHostIP: localIP.isEmpty ? nil : localIP) { [self] result in
             DispatchQueue.main.async {
                 self.autoBusy = false
+                if case .failure(let error) = result {
+                    self.session.appendUser("部署失败：\(error.localizedDescription)")
+                }
             }
         }
     }
 
     private func autoRecord() {
-        guard !autoBusy, !session.isRunning else { return }
+        // ★ 这里以前是两个静默 return：按钮点了完全没反应、也不留日志。
+        // 真机排查时最难受的就是这种「什么都不发生」，所以一律打日志。
+        guard !session.isRunning else {
+            session.appendUser("已经在录制中，先点「停止录制」")
+            return
+        }
+        guard !autoBusy else {
+            session.appendUser("上一个部署/启动流程还没结束，请稍等十几秒再点")
+            return
+        }
         autoBusy = true
         session.clearRecordResult()
         session.update(params: fusionParams)
         let given = host.trimmingCharacters(in: .whitespacesAndNewlines)
         let localIP = iphoneHostIP.trimmingCharacters(in: .whitespacesAndNewlines)
+        session.appendUser("点「开始录制」：开始走离线链路（部署 → 眼镜本地录制）")
         session.startAuto(host: given.isEmpty ? nil : given,
                           iphoneHostIP: localIP.isEmpty ? nil : localIP,
                           screenPort: UInt16(screenPort) ?? 9114,

@@ -122,8 +122,14 @@ final class RecorderSession: ObservableObject {
 
     private func startOffline(host: String?, iphoneHostIP: String?,
                               completion: @escaping (Result<Void, Error>) -> Void) {
-        guard !isRunning, offlinePhase == .idle || offlinePhase == .saving else {
-            completion(.failure(ADBError.connectionFailed("正在录制或收尾中")))
+        // 只有真正在录/在收尾时才拒绝。.deploying 允许重入 ——
+        // 上一次部署中途失败会把状态卡在 deploying，老逻辑会永久挡住「开始录制」，
+        // 表现就是点了没反应（且一个字都不打）。
+        let busyPhases: [OfflinePhase] = [.recording, .stopping, .pulling, .composing, .saving]
+        guard !isRunning, !busyPhases.contains(offlinePhase) else {
+            let e = ADBError.connectionFailed("正在录制或收尾中（\(offlinePhase.rawValue)）")
+            append("忽略本次开始：\(e.localizedDescription)")
+            completion(.failure(e))
             return
         }
         clearRecordResult()
@@ -142,62 +148,65 @@ final class RecorderSession: ObservableObject {
         }
     }
 
-    /// 部署完成后另建一条 ADB 连接，专管停止/pull（职责与 orchestrator 分开）。
+    /// 部署完成后**复用**那条已授权的 ADB 连接来启动录制。
+    ///
+    /// 0.4.1 及之前这里另开一条 ADBClient，真机上第二条连接经常只走到
+    /// `AUTH 第 2 轮 → PUBLICKEY` 甚至 `CNXN` 之后就再没有回调，
+    /// 于是点「开始录制」看起来完全没反应（日志停在握手）。复用连接直接消掉这段。
     private func connectAndStartRecording(completion: @escaping (Result<Void, Error>) -> Void) {
         guard let glassesIP = orchestrator.glassesIP else {
             let e = ADBError.connectionFailed("拿不到眼镜 IP")
-            setPhase(.idle, "失败")
+            setPhase(.idle, "失败：拿不到眼镜 IP")
             completion(.failure(e))
             return
         }
-        let client = ADBClient(host: glassesIP, port: 5555)
-        client.log = { [weak self] message in self?.append("[ADB] \(message)") }
-        client.connect { [weak self] result in
+        guard let client = orchestrator.adb else {
+            let e = ADBError.connectionFailed("部署用的 ADB 连接已失效")
+            setPhase(.idle, "失败：ADB 连接已失效，请重新点「① 自动部署采集端」")
+            completion(.failure(e))
+            return
+        }
+        adb = client
+        append("复用已授权的 ADB 连接 \(glassesIP)，准备启动眼镜本地录制")
+
+        // 建好相机可写目录、清停止标记、叫醒并保持屏幕常亮
+        client.shell(CaptureOrchestrator.prepareRecordCommand(), timeout: 25) { [weak self] prep in
             guard let self = self else { return }
-            switch result {
-            case .failure(let error):
-                self.setPhase(.idle, "失败")
-                completion(.failure(error))
-            case .success:
-                self.adb = client
-                self.append("ADB 已连接 \(glassesIP)，启动眼镜本地录制")
-                // 建好相机可写目录（/data/local/tmp 本身只有 shell 可写）并清停止标记
-                client.shell(CaptureOrchestrator.prepareRecordCommand()) { [weak self] _ in
+            if case .failure(let error) = prep {
+                self.append("准备命令失败（继续尝试录制）：\(error.localizedDescription)")
+            }
+            let screenCmd = CaptureOrchestrator.screenRecordStartCommand()
+            guard CaptureOrchestrator.isSafeCommand(screenCmd) else {
+                completion(.failure(ADBError.connectionFailed("屏幕录制命令非法")))
+                return
+            }
+            // 屏幕录制是长驻进程，用 shellDetached 保持通道
+            client.shellDetached(screenCmd) { [weak self] screenResult in
+                guard let self = self else { return }
+                switch screenResult {
+                case .failure(let error):
+                    self.setPhase(.idle, "失败：屏幕录制启动不了（\(error.localizedDescription)）")
+                    completion(.failure(error))
+                    return
+                case .success:
+                    self.append("屏幕本地录制已启动 → \(self.screenRemotePath)")
+                }
+                let cameraCmd = CaptureOrchestrator.cameraRecordStartCommand()
+                guard CaptureOrchestrator.isSafeCommand(cameraCmd) else {
+                    completion(.failure(ADBError.connectionFailed("相机录制命令非法")))
+                    return
+                }
+                client.shell(cameraCmd, timeout: 30) { [weak self] cameraResult in
                     guard let self = self else { return }
-                    let screenCmd = CaptureOrchestrator.screenRecordStartCommand()
-                    guard CaptureOrchestrator.isSafeCommand(screenCmd) else {
-                        completion(.failure(ADBError.connectionFailed("屏幕录制命令非法")))
-                        return
-                    }
-                    // 屏幕录制是长驻进程，用 shellDetached 保持通道
-                    client.shellDetached(screenCmd) { [weak self] screenResult in
-                        guard let self = self else { return }
-                        switch screenResult {
-                        case .failure(let error):
-                            self.setPhase(.idle, "失败")
-                            completion(.failure(error))
-                            return
-                        case .success:
-                            self.append("屏幕本地录制已启动 → \(self.screenRemotePath)")
-                        }
-                        let cameraCmd = CaptureOrchestrator.cameraRecordStartCommand()
-                        guard CaptureOrchestrator.isSafeCommand(cameraCmd) else {
-                            completion(.failure(ADBError.connectionFailed("相机录制命令非法")))
-                            return
-                        }
-                        client.shell(cameraCmd, timeout: 30) { [weak self] cameraResult in
-                            guard let self = self else { return }
-                            switch cameraResult {
-                            case .failure(let error):
-                                self.setPhase(.idle, "失败")
-                                completion(.failure(error))
-                            case .success(let output):
-                                self.append("相机本地录制已启动 → \(self.cameraRemotePath) "
-                                            + output.trimmingCharacters(in: .whitespacesAndNewlines))
-                                self.markRecordingStarted()
-                                completion(.success(()))
-                            }
-                        }
+                    switch cameraResult {
+                    case .failure(let error):
+                        self.setPhase(.idle, "失败：相机录制启动不了（\(error.localizedDescription)）")
+                        completion(.failure(error))
+                    case .success(let output):
+                        self.append("相机本地录制已启动 → \(self.cameraRemotePath) "
+                                    + output.trimmingCharacters(in: .whitespacesAndNewlines))
+                        self.markRecordingStarted()
+                        completion(.success(()))
                     }
                 }
             }

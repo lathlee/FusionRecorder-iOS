@@ -129,6 +129,8 @@ final class ADBClient {
             path: path, mode: mode, data: data,
             mtime: UInt32(Date().timeIntervalSince1970))
         var finished = false
+        // 上一轮 push 可能留下半截响应帧，必须先清掉，否则会把旧字节当成这次的应答
+        syncBuffer.removeAll(keepingCapacity: false)
         let finish: (Result<Void, Error>) -> Void = { [weak self] result in
             guard let self = self else { return }
             self.finishLock.lock()
@@ -148,13 +150,15 @@ final class ADBClient {
                  self.syncBuffer.append(chunk)
                  while let parsed = ADBSyncPusher.parseResponse(self.syncBuffer) {
                      self.syncBuffer.removeSubrange(0..<parsed.consumed)
-                     switch parsed.result {
-                     case .success:
+                     switch parsed.outcome {
+                     case .ok:
                          finish(.success(()))
                          self.closeStream(localId)
-                     case .failure(let error):
-                         finish(.failure(error))
+                     case .failed(let message):
+                         finish(.failure(ADBSyncError.rejected(message)))
                          self.closeStream(localId)
+                     case .ignored:
+                         continue
                      }
                  }
              },

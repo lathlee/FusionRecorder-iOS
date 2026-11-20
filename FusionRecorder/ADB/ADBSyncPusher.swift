@@ -58,21 +58,29 @@ struct ADBSyncPusher {
         return frames
     }
 
-    /// 解析 sync 响应：OKAY → success；FAIL → 带消息的错误；不足 8 字节 → nil 继续收。
-    static func parseResponse(_ buffer: Data) -> (result: Result<Void, Error>, consumed: Int)? {
+    /// sync 响应的三种结局
+    enum Outcome {
+        case ok                 // OKAY：设备确认写入完成
+        case failed(String)      // FAIL：设备拒绝
+        case ignored             // 其它帧（DATA/DENT…）：丢掉继续等
+    }
+
+    /// 解析 sync 响应。
+    /// ★ 只有 OKAY 才算成功。老逻辑把「未知帧」也当成功，会在设备还没写完时
+    /// 就回报 push 成功，随后 `pm install` 报 "Can't open file"（真机 16:31 复现）。
+    static func parseResponse(_ buffer: Data) -> (outcome: Outcome, consumed: Int)? {
         guard buffer.count >= 8 else { return nil }
         let id = String(decoding: buffer.prefix(4), as: UTF8.self)
         let length = Int(leValue(buffer, at: 4))
         guard buffer.count >= 8 + length else { return nil }
         switch id {
         case "OKAY":
-            return (.success(()), 8 + length)
+            return (.ok, 8 + length)
         case "FAIL":
             let message = String(decoding: buffer.dropFirst(8).prefix(length), as: UTF8.self)
-            return (.failure(ADBSyncError.rejected(message)), 8 + length)
+            return (.failed(message), 8 + length)
         default:
-            // DATA/DENT 等意外响应（push 不应收到），原样丢弃继续收
-            return (Result<Void, Error>.success(()), 8 + length)
+            return (.ignored, 8 + length)
         }
     }
 
