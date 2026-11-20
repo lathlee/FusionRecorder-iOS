@@ -27,9 +27,11 @@ settings:
     # 0.3.7 = 重构成败关键：合成与写帧解耦(异步合成+恒定20fps写帧)，默认分辨率降640×480
     # 0.3.8 = 修 0.3.7 画面冻结：合成改独立20fps定时器+取两路最新帧；加2秒诊断日志
     # 0.3.9 = 修眼镜端相机流中途断线不自恢复（停推30+s）：sender自动重连补发SPS/PPS + wake lock
-    # 0.4.0 = 离线录制架构：眼镜本地双路录 mp4 → ADB pull → iPhone 离线合成；根治网络抖动冻结
-    MARKETING_VERSION: "0.4.0"
-    CURRENT_PROJECT_VERSION: "11"
+    # 0.4.0 = 离线录制架构：眼镜本地双路录 mp4 → ADB pull → iPhone 离线合成
+    # 0.4.1 = 0.4.0 真机修复：WAKE_LOCK 权限 / 相机 mp4 落 App 私有目录 /
+    #         绝对时间 meta 两行（首帧pts+结束时刻）修正两路对齐与 VFR 时长
+    MARKETING_VERSION: "0.4.1"
+    CURRENT_PROJECT_VERSION: "12"
     # 侧载不需要 Apple 签名，签名交给 SideStore / AltStore 用免费 Apple ID 做
     CODE_SIGNING_ALLOWED: "NO"
     CODE_SIGNING_REQUIRED: "NO"

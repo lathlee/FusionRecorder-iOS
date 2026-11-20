@@ -47,6 +47,15 @@ enum OfflineComposeError: Error, LocalizedError {
     }
 }
 
+/// 一路录制文件的绝对时间信息（来自眼镜写的 `<mp4>.meta` 两行）。
+struct TrackMeta {
+    /// 首帧的绝对 pts（elapsedRealtime 微秒）。MediaMuxer 会把 mp4 内首帧归一化成 0，
+    /// 靠这个偏移才能把两路放回同一时间轴。
+    let firstPTS: Int64
+    /// 真实结束时刻（同钟）。VFR 下 mp4 自带 duration 可能明显偏短。
+    let endPTS: Int64
+}
+
 /// 单路 mp4 的顺序读帧器。内部维护「下一帧」预读，
 /// frame(atOrBefore:) 返回不晚于目标时刻的最新帧，天然实现重复帧/不同帧率对齐。
 private final class Mp4FrameReader {
@@ -61,6 +70,8 @@ private final class Mp4FrameReader {
     private let ciContext = CIContext()
     private let rotation: Int
     private let label: String
+    /// 加回被 MediaMuxer 抹掉的绝对起点，使两路 pts 落在同一时基上
+    private let ptsOffsetUs: Int64
 
     private var nextFrame: Frame?
     private(set) var lastDelivered: Frame?
@@ -70,9 +81,10 @@ private final class Mp4FrameReader {
     private(set) var firstPTS: Int64?
     private(set) var durationUs: Int64 = 0
 
-    init(url: URL, rotation: Int, label: String) throws {
+    init(url: URL, rotation: Int, label: String, ptsOffsetUs: Int64 = 0) throws {
         self.rotation = rotation
         self.label = label
+        self.ptsOffsetUs = ptsOffsetUs
 
         let asset = AVAsset(url: url)
         let duration = asset.duration
@@ -113,7 +125,8 @@ private final class Mp4FrameReader {
             }
             return nil
         }
-        let ptsUs = Int64(sample.presentationTimeStamp.seconds * 1_000_000)
+        let rawUs = Int64(sample.presentationTimeStamp.seconds * 1_000_000)
+        let ptsUs = rawUs + ptsOffsetUs
         guard let buffer = CMSampleBufferGetImageBuffer(sample) else {
             return readOne()   // 非图像样本，跳到下一帧
         }
@@ -166,13 +179,22 @@ final class OfflineCompositor {
     static let outputFPS: Int64 = 20
 
     /// 合成并写片。progress 在后台线程调用，调用方需自行切主线程更新 UI。
+    ///
+    /// - parameters:
+    ///   - screenMeta / cameraMeta: 眼镜在录制结束时写的绝对时间信息
+    ///     （首帧 pts + 结束时刻）。缺省时退回「mp4 从 0 开始 + 自带时长」，
+    ///     那样两路启动先后会被忽略，同步精度差。
     static func compose(screenURL: URL,
                         cameraURL: URL,
                         outputURL: URL,
                         params: FusionParams,
+                        screenMeta: TrackMeta? = nil,
+                        cameraMeta: TrackMeta? = nil,
                         progress: ((Double) -> Void)? = nil) throws -> OfflineComposeResult {
-        let screen = try Mp4FrameReader(url: screenURL, rotation: 0, label: "屏幕")
-        let camera = try Mp4FrameReader(url: cameraURL, rotation: 180, label: "相机")
+        let screen = try Mp4FrameReader(url: screenURL, rotation: 0, label: "屏幕",
+                                        ptsOffsetUs: screenMeta?.firstPTS ?? 0)
+        let camera = try Mp4FrameReader(url: cameraURL, rotation: 180, label: "相机",
+                                        ptsOffsetUs: cameraMeta?.firstPTS ?? 0)
 
         guard let s0 = screen.firstPTS, let c0 = camera.firstPTS else {
             screen.cancel(); camera.cancel()
@@ -180,10 +202,10 @@ final class OfflineCompositor {
         }
         // 共享区间起点：两路都已经有画面的时刻
         let startPTS = max(s0, c0)
-        // 终点估算：任一路「首帧 + 时长」的较小者。只用于进度条和兜底终止；
-        // 若 AVAsset 没给出有效时长，绝不能拿 0 当终点（否则第一帧后就 break）。
-        let sEnd = s0 + screen.durationUs
-        let cEnd = c0 + camera.durationUs
+        // 终点：优先用眼镜写下的真实结束时刻（meta），否则退回「首帧 + 时长」。
+        // 只用于进度条和终止条件；若两者都没有有效值，绝不能拿 0 当终点。
+        let sEnd = screenMeta?.endPTS ?? (s0 + screen.durationUs)
+        let cEnd = cameraMeta?.endPTS ?? (c0 + camera.durationUs)
         let estimatedEnd = min(sEnd, cEnd)
         let hasEstimate = estimatedEnd > startPTS
         let totalUs = hasEstimate ? estimatedEnd - startPTS : 1
@@ -202,32 +224,33 @@ final class OfflineCompositor {
             camera.cancel()
         }
 
+        // ★ 关键：终止条件必须由时间轴决定，不能由「哪一路先读完」决定。
+        // 屏幕路是 VFR 录制，画面静止时可能只有几帧 —— 它「读完」不代表视频只有几秒。
+        // 只有拿不到结束标记、也没有有效时长时，才退回用 exhausted 兜底。
         while true {
+            if hasEstimate && target - startPTS >= totalUs { break }
+            if !hasEstimate && (screen.exhausted || camera.exhausted) { break }
+            if written > 20 * 3600 * 4 { break }     // 4 小时硬上限，防死循环
+
             // CIContext.createCGImage 产出的是 autoreleased CGImage。合成几十秒的
             // 视频会有上千帧，不在每帧 drain autorelease pool 的话内存会线性涨到 GB 级。
+            // frame(atOrBefore:) 在该路读完后会一直返回最后一帧，天然实现「静止画面重复」。
             let composed: CGImage? = autoreleasepool {
                 guard let s = screen.frame(atOrBefore: target),
                       let c = camera.frame(atOrBefore: target) else { return nil }
                 return FusionCompositor.render(screen: s.image, camera: c.image, params: params)
             }
-            guard let composed = composed else {
-                if screen.exhausted || camera.exhausted { break }
-                continue
+            if let composed = composed {
+                try writer.append(frame: composed, presentationTimeUs: target - startPTS)
+                written += 1
+                if written - lastReport >= 20 {      // 每秒报一次进度
+                    lastReport = written
+                    let ratio = hasEstimate
+                        ? min(1.0, Double(target - startPTS) / Double(totalUs)) : 0
+                    progress?(ratio)
+                }
             }
-            try writer.append(frame: composed, presentationTimeUs: target - startPTS)
-            written += 1
-
-            if written - lastReport >= 20 {          // 每秒报一次进度
-                lastReport = written
-                let ratio = hasEstimate
-                    ? min(1.0, Double(target - startPTS) / Double(totalUs)) : 0
-                progress?(ratio)
-            }
-
-            // 按短的那路裁剪：任一路读完即停，但已经写入的这一帧保留
-            if screen.exhausted || camera.exhausted { break }
-            if hasEstimate && target - startPTS >= totalUs { break }
-            if written > 20 * 3600 * 4 { break }     // 4 小时硬上限，防死循环
+            // target 必须无条件前进，否则 composed == nil 时会死循环
             target += stepUs
         }
 

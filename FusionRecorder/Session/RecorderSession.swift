@@ -70,7 +70,7 @@ final class RecorderSession: ObservableObject {
 
     // 远端与本地文件路径
     private let screenRemotePath = "/data/local/tmp/fusion_screen.mp4"
-    private let cameraRemotePath = "/data/local/tmp/fusion_camera.mp4"
+    private let cameraRemotePath = "/sdcard/Android/data/com.fusion.capture/files/fusion_camera.mp4"
     private var screenLocalURL: URL?
     private var cameraLocalURL: URL?
     private var outputLocalURL: URL?
@@ -161,8 +161,8 @@ final class RecorderSession: ObservableObject {
             case .success:
                 self.adb = client
                 self.append("ADB 已连接 \(glassesIP)，启动眼镜本地录制")
-                // 清掉上一次残留的停止标记
-                client.shell(CaptureOrchestrator.cleanStopFlagCommand()) { [weak self] _ in
+                // 建好相机可写目录（/data/local/tmp 本身只有 shell 可写）并清停止标记
+                client.shell(CaptureOrchestrator.prepareRecordCommand()) { [weak self] _ in
                     guard let self = self else { return }
                     let screenCmd = CaptureOrchestrator.screenRecordStartCommand()
                     guard CaptureOrchestrator.isSafeCommand(screenCmd) else {
@@ -318,12 +318,45 @@ final class RecorderSession: ObservableObject {
                     catch { self.fail("保存相机 mp4 失败：\(error.localizedDescription)"); return }
                     self.append("相机 mp4 已拉取（\(data.count) 字节）")
                 }
-                // 远端文件拉完即可删，避免眼镜存储越积越多
-                adb.shell("rm -f \(self.screenRemotePath) \(self.cameraRemotePath)") { _ in }
-                self.composeOffline(screenURL: screenURL, cameraURL: cameraURL,
-                                    outputURL: outputURL)
+                // 先读眼镜写下的绝对时间信息（首帧 pts + 真实结束时刻）
+                self.readTrackMetas(adb: adb) { screenMeta, cameraMeta in
+                    adb.shell("rm -f \(self.screenRemotePath) \(self.screenRemotePath).meta "
+                              + "\(self.cameraRemotePath) \(self.cameraRemotePath).meta") { _ in }
+                    self.composeOffline(screenURL: screenURL, cameraURL: cameraURL,
+                                        outputURL: outputURL,
+                                        screenMeta: screenMeta, cameraMeta: cameraMeta)
+                }
             }
         }
+    }
+
+    /// 读取两路的 `<mp4>.meta`：第 1 行首帧绝对 pts，第 2 行结束时刻。
+    private func readTrackMetas(adb: ADBClient,
+                                completion: @escaping (TrackMeta?, TrackMeta?) -> Void) {
+        adb.shell("cat \(screenRemotePath).meta 2>/dev/null || echo 0", timeout: 10) { sResult in
+            let sText = (try? sResult.get())?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? "0"
+            adb.shell("cat \(cameraRemotePath).meta 2>/dev/null || echo 0",
+                      timeout: 10) { [weak self] cResult in
+                let cText = (try? cResult.get())?
+                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? "0"
+                let sMeta = Self.parseTrackMeta(sText)
+                let cMeta = Self.parseTrackMeta(cText)
+                self?.append("时间标记：屏幕=\(sText.replacingOccurrences(of: "\n", with: "/")) "
+                             + "相机=\(cText.replacingOccurrences(of: "\n", with: "/"))")
+                completion(sMeta, cMeta)
+            }
+        }
+    }
+
+    private static func parseTrackMeta(_ text: String) -> TrackMeta? {
+        let lines = text.split(separator: "\n")
+            .map { String($0).trimmingCharacters(in: .whitespaces) }
+        guard lines.count >= 2,
+              let first = Int64(lines[0]),
+              let end = Int64(lines[1]),
+              first > 0, end > first else { return nil }
+        return TrackMeta(firstPTS: first, endPTS: end)
     }
 
     private func updatePullProgress() {
@@ -332,7 +365,8 @@ final class RecorderSession: ObservableObject {
         phaseDetail = String(format: "传输 mp4（%.0f%%）…", ratio * 100)
     }
 
-    private func composeOffline(screenURL: URL, cameraURL: URL, outputURL: URL) {
+    private func composeOffline(screenURL: URL, cameraURL: URL, outputURL: URL,
+                                screenMeta: TrackMeta?, cameraMeta: TrackMeta?) {
         setPhase(.composing, "离线合成中（两路按绝对 pts 对齐，按短的那路裁剪）…")
         let params = self.params
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -342,7 +376,9 @@ final class RecorderSession: ObservableObject {
                     screenURL: screenURL,
                     cameraURL: cameraURL,
                     outputURL: outputURL,
-                    params: params) { ratio in
+                    params: params,
+                    screenMeta: screenMeta,
+                    cameraMeta: cameraMeta) { ratio in
                         DispatchQueue.main.async { [weak self] in
                             guard let self = self else { return }
                             self.offlineProgress = ratio

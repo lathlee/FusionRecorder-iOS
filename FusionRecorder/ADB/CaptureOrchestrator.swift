@@ -76,8 +76,17 @@ final class CaptureOrchestrator: ObservableObject {
     // MARK: - 0.4.0 离线录制命令（替代原来的实时推流启动）
 
     static let screenMP4Path = "/data/local/tmp/fusion_screen.mp4"
-    static let cameraMP4Path = "/data/local/tmp/fusion_camera.mp4"
+    /// 相机 mp4 必须落在 App 自己能写的地方。/data/local/tmp 对 untrusted_app
+    /// 是 SELinux 硬限制（改 chmod 也 EACCES），所以用 App 的外部私有目录：
+    /// App 可写，shell(ADB pull) 也能读（sdcardfs 按目录归属映射）。
+    static let cameraMP4Dir = "/sdcard/Android/data/com.fusion.capture/files"
+    static let cameraMP4Path = cameraMP4Dir + "/fusion_camera.mp4"
     static let screenStopFlag = "/data/local/tmp/fusion_stop_screen"
+
+    /// 录制前的准备：确保相机目录存在、清掉上次的停止标记。
+    static func prepareRecordCommand() -> String {
+        "mkdir -p \(cameraMP4Dir); rm -f \(screenStopFlag)"
+    }
 
     /// 屏幕流：shell uid 的 app_process 本地录 mp4。参数槽位：
     /// ScreenPush <outPath> <sec> <w> <h> <fps> <bitrate> <iframe> <pts占位> <repeatUs>
