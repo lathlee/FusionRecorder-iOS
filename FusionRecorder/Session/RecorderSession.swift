@@ -77,7 +77,9 @@ final class RecorderSession: ObservableObject {
 
     private let recordingCompositor = RecordingCompositor(params: FusionParams())
     private var screenDecoder = H264FrameDecoder()
-    private var cameraDecoder = H264FrameDecoder()
+    // 眼镜摄像头 sensor orientation=180，采集端输出倒像；相机流解码后旋转补正。
+    // 屏幕流不需要旋转。抓帧预览与录制共用同一 decoder 配置，保证"预览=成片"。
+    private var cameraDecoder = H264FrameDecoder(rotation: 180)
 
     /// 全自动部署编排器（发现 → ADB → push → 启动两路）
     /// 由 ContentView 注入并共用同一实例，便于 UI 观察状态
@@ -93,7 +95,7 @@ final class RecorderSession: ObservableObject {
     private var captureScreenReceiver: H264StreamReceiver?
     private var captureCameraReceiver: H264StreamReceiver?
     private var captureScreenDecoder = H264FrameDecoder()
-    private var captureCameraDecoder = H264FrameDecoder()
+    private var captureCameraDecoder = H264FrameDecoder(rotation: 180)
 
     private let frameLock = NSLock()
     private var liveScreen: CGImage?
@@ -108,8 +110,17 @@ final class RecorderSession: ObservableObject {
     private var cfrTimer: DispatchSourceTimer?
     private let cfrQueue = DispatchQueue(label: "com.lath.fusionrecorder.cfr")
     private var timelineOriginUs: Int64?
+    /// 建立时间零点那一刻的真实墙钟（微秒）。成片 pts 跟随真实经过时间，
+    /// 而不是"帧序号 × 50ms"——后者在合成慢（写帧少）时会把成片时长压缩，
+    /// 表现为"只保存了前面一段，后面没了"。
+    private var wallClockBaseUs: Int64?
     private var outputFrameIndex: Int64 = 0
     private let outputFPS: Int64 = 20
+
+    /// 单调墙钟微秒（DispatchTime，不受系统时间调整影响）
+    private static func nowWallUs() -> Int64 {
+        Int64(DispatchTime.now().uptimeNanoseconds / 1_000)
+    }
 
     /// UI 在每次参数变化时调用，保证录制用的就是预览里那组数值
     func update(params: FusionParams) {
@@ -189,11 +200,12 @@ final class RecorderSession: ObservableObject {
         }
 
         screenDecoder = H264FrameDecoder()
-        cameraDecoder = H264FrameDecoder()
+        cameraDecoder = H264FrameDecoder(rotation: 180)
         frameLock.lock()
         screenQueue.clear()
         cameraQueue.clear()
         timelineOriginUs = nil
+        wallClockBaseUs = nil
         outputFrameIndex = 0
         frameLock.unlock()
 
@@ -265,6 +277,11 @@ final class RecorderSession: ObservableObject {
             movieWriter?.cancel()
             movieWriter = nil
             append("已停止（没有可写入的帧）")
+            // 必须通知 UI：否则 ContentView 的 isFinishing 靠 recordError/finishedMovieURL
+            // 的 onChange 退出，两者都不变就永远卡在「正在封装成片并保存相册」。
+            let msg = "没有收到可写入的帧：确认眼镜两路流都已接入（9114/9115）、屏幕点亮，再点「全自动录制」"
+            recordError = msg
+            append(msg)
             return
         }
         append("正在封装成片（\(writer.writtenFrames) 帧）…")
@@ -300,6 +317,9 @@ final class RecorderSession: ObservableObject {
         if timelineOriginUs == nil {
             if let s = screenQueue.firstPTS, let c = cameraQueue.firstPTS {
                 timelineOriginUs = min(s, c)
+                // 同时记下真实墙钟：成片时间轴按真实经过时间推进，
+                // 写帧慢/掉帧时后续帧仍拿到正确的 pts，不会把时长压缩。
+                wallClockBaseUs = Self.nowWallUs()
                 append("两路首帧 pts 差 \(abs(s - c)) μs，时间零点已建立")
             }
         }
@@ -337,12 +357,18 @@ final class RecorderSession: ObservableObject {
         guard isRunning, let writer = movieWriter else { return }
         frameLock.lock()
         let origin = timelineOriginUs
+        let baseUs = wallClockBaseUs
         let sEmpty = screenQueue.isEmpty
         let cEmpty = cameraQueue.isEmpty
         frameLock.unlock()
-        guard let t0 = origin, !sEmpty, !cEmpty else { return }
+        guard let t0 = origin, let base = baseUs, !sEmpty, !cEmpty else { return }
 
-        let targetUs = t0 + outputFrameIndex * 1_000_000 / outputFPS
+        // ★ pts 跟随真实墙钟：targetUs = 时间零点 + 真实经过时间。
+        // 不再用 outputFrameIndex×50ms——那样合成一慢（1280×720 逐像素 Swift 很重），
+        // 写帧数就落后，成片时长被压成"帧数/20fps"，丢掉后半段。
+        // 用真实时间后，即使掉帧，后续帧也拿到正确 pts，成片时长 = 实际录制时长。
+        let elapsedUs = max(0, Self.nowWallUs() - base)
+        let targetUs = t0 + elapsedUs
         frameLock.lock()
         let s = screenQueue.anchor(before: targetUs)
         let c = cameraQueue.anchor(before: targetUs)
@@ -351,7 +377,7 @@ final class RecorderSession: ObservableObject {
 
         guard let composed = recordingCompositor.compose(screen: s.image, camera: c.image) else { return }
         do {
-            // 用目标 CFR 时刻作 pts：静止帧自然重复，时间轴均匀无漂移
+            // 用真实 CFR 时刻作 pts：掉帧时后面的帧仍按真实时间写，时长不缩水
             try writer.append(frame: composed, presentationTimeUs: targetUs)
             outputFrameIndex += 1
             if outputFrameIndex % 20 == 0 {
@@ -360,7 +386,7 @@ final class RecorderSession: ObservableObject {
                 }
             }
             if outputFrameIndex % 40 == 0 {
-                append("已写 \(outputFrameIndex) 帧（t=\(Double(targetUs - t0) / 1e6)s）")
+                append("已写 \(outputFrameIndex) 帧 / \(String(format: "%.1f", Double(elapsedUs) / 1e6))s")
             }
         } catch {
             recordError = error.localizedDescription
@@ -383,7 +409,7 @@ final class RecorderSession: ObservableObject {
         frameLock.unlock()
 
         captureScreenDecoder = H264FrameDecoder()
-        captureCameraDecoder = H264FrameDecoder()
+        captureCameraDecoder = H264FrameDecoder(rotation: 180)
         let sd = captureScreenDecoder
         let cd = captureCameraDecoder
 

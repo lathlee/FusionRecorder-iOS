@@ -513,12 +513,10 @@ struct ContentView: View {
             session.stop()
             isFinishing = true
         } else {
-            session.clearRecordResult()
-            session.update(params: fusionParams)
-            session.start(host: host,
-                          screenPort: UInt16(screenPort) ?? 9114,
-                          cameraPort: UInt16(cameraPort) ?? 9115)
-            showRecording = true
+            // 主「开始录制」按钮统一走全自动流程（部署采集端 + 开监听 + 收流写片）。
+            // 旧的手动方向（iPhone 主动连眼镜 server）与现在的采集端 client 模式不匹配，
+            // 会连不上→0 帧→卡在封装界面。全自动是唯一可用路径，按钮语义与②对齐。
+            autoRecord()
         }
     }
 

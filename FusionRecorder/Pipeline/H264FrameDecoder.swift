@@ -19,6 +19,13 @@ import CoreImage
 
 final class H264FrameDecoder {
 
+    /// 解码后对像素做的固定旋转补偿（度）。眼镜摄像头 sensor orientation=180，
+    /// 相机流解码帧需要 180° 补偿才正立；屏幕流为 0。旋转在这里做，
+    /// 抓帧预览与正式录制共用本类，因此"预览 = 成片"依然成立。
+    private let rotation: Int
+
+    init(rotation: Int = 0) { self.rotation = rotation }
+
     private var sps: Data?
     private var pps: Data?
     private var formatDescription: CMVideoFormatDescription?
@@ -203,8 +210,18 @@ final class H264FrameDecoder {
     }
 
     private func onDecoded(_ buffer: CVImageBuffer) {
-        let image = CIImage(cvImageBuffer: buffer)
-        guard let cg = ciContext.createCGImage(image, from: image.extent) else { return }
+        var image = CIImage(cvImageBuffer: buffer)
+        // 眼镜摄像头 sensor 倒装（orientation=180），采集端输出的是倒像，
+        // 这里统一旋转补正。CIImage.oriented 只改方向元数据不重新采样，开销极小。
+        if rotation == 180 {
+            image = image.oriented(.down)
+        } else if rotation == 90 {
+            image = image.oriented(.left)
+        } else if rotation == 270 {
+            image = image.oriented(.right)
+        }
+        let extent = image.extent
+        guard let cg = ciContext.createCGImage(image, from: extent) else { return }
         lock.lock()
         latest = cg
         lock.unlock()
