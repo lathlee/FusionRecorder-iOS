@@ -30,8 +30,11 @@ settings:
     # 0.4.0 = 离线录制架构：眼镜本地双路录 mp4 → ADB pull → iPhone 离线合成
     # 0.4.1 = 0.4.0 真机修复：WAKE_LOCK 权限 / 相机 mp4 落 App 私有目录 /
     #         绝对时间 meta 两行（首帧pts+结束时刻）修正两路对齐与 VFR 时长
-    MARKETING_VERSION: "0.4.1"
-    CURRENT_PROJECT_VERSION: "12"
+    # 0.4.2 = 拉取链路修正：RECV 结束帧是 DONE 不是 OKAY（否则 pull 永远等不到完成）/
+    #         Data 切片按 startIndex 取偏移（DENT 的 size 会读错）/ 拉取改空闲超时 /
+    #         录制前把屏幕叫醒并保持常亮（屏幕路没帧就录不出东西）
+    MARKETING_VERSION: "0.4.2"
+    CURRENT_PROJECT_VERSION: "13"
     # 侧载不需要 Apple 签名，签名交给 SideStore / AltStore 用免费 Apple ID 做
     CODE_SIGNING_ALLOWED: "NO"
     CODE_SIGNING_REQUIRED: "NO"

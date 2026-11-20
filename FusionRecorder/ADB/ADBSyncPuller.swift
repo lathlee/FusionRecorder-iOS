@@ -66,7 +66,10 @@ struct ADBSyncPuller {
                 }
             case "DATA":
                 events.append(.data(Data(payload)))
-            case "OKAY":
+            case "OKAY", "DONE":
+                // ★ 关键：RECV 的结束帧是 DONE（AOSP file_sync_service do_recv 末尾
+                // 发 ID_DONE），不是 OKAY —— OKAY 只用于 SEND(push) 的应答。
+                // 两种都认，避免不同 adbd 实现差异导致 pull 永远等不到结束。
                 events.append(.done)
             case "FAIL":
                 events.append(.failed(String(decoding: payload, as: UTF8.self)))
@@ -91,8 +94,12 @@ struct ADBSyncPuller {
          UInt8((value >> 16) & 0xff), UInt8((value >> 24) & 0xff)]
     }
 
+    /// 从 Data 的指定相对偏移读一个小端 u32。
+    /// 注意：Data 切片（`buffer[a..<b]`）保留父容器的 Index，`payload[4..<8]`
+    /// 并不是「payload 的第 4 字节」，必须用 startIndex 做基准重新换算。
     private static func leValue(_ data: Data, at offset: Int) -> UInt32 {
-        let b = [UInt8](data[offset..<(offset + 4)])
+        let base = data.startIndex + offset
+        let b = [UInt8](data[base..<(base + 4)])
         return UInt32(b[0]) | (UInt32(b[1]) << 8)
             | (UInt32(b[2]) << 16) | (UInt32(b[3]) << 24)
     }

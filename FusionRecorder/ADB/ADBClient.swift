@@ -170,7 +170,10 @@ final class ADBClient {
     // MARK: - sync pull（0.4.0 离线录制：拉回眼镜本地的两个 mp4）
 
     /// 从设备拉取一个文件的完整字节。progress 回调已切到主线程，0...1。
-    func pull(path: String, timeout: TimeInterval = 120,
+    /// 拉取远端文件。timeout 是「空闲超时」：每收到一块数据就重新计时，
+    /// 所以真正限制的是「链路卡死多久算失败」，而不是总时长。
+    /// 眼镜实测无线 ADB 只有 0.2~0.5MB/s，1 分钟录制约 12MB，硬性总超时会误杀。
+    func pull(path: String, timeout: TimeInterval = 45,
               progress: ((Double) -> Void)? = nil,
               completion: @escaping (Result<Data, Error>) -> Void) {
         let request = ADBSyncPuller.recvFrame(path: path)
@@ -195,6 +198,7 @@ final class ADBClient {
              },
              onData: { [weak self] localId, chunk in
                  guard let self = self else { return }
+                 self.bumpTimeout(localId, timeout: timeout)
                  self.pullBuffer.append(chunk)
                  let parsed = ADBSyncPuller.parseResponses(self.pullBuffer)
                  if parsed.consumed > 0 {
@@ -266,6 +270,12 @@ final class ADBClient {
         payload.append(0)
         send(ADBPacket(command: ADBPacket.OPEN, arg0: localId, arg1: 0, payload: payload))
         return localId
+    }
+
+    /// 把流的超时往后推（幂等）：有大块数据在流动就说明链路还活着。
+    private func bumpTimeout(_ localId: UInt32, timeout: TimeInterval) {
+        guard timeout > 0, let stream = streams[localId], let timer = stream.timer else { return }
+        timer.schedule(deadline: .now() + timeout)
     }
 
     private func write(_ localId: UInt32, _ payload: Data) {

@@ -321,7 +321,8 @@ final class RecorderSession: ObservableObject {
                 // 先读眼镜写下的绝对时间信息（首帧 pts + 真实结束时刻）
                 self.readTrackMetas(adb: adb) { screenMeta, cameraMeta in
                     adb.shell("rm -f \(self.screenRemotePath) \(self.screenRemotePath).meta "
-                              + "\(self.cameraRemotePath) \(self.cameraRemotePath).meta") { _ in }
+                              + "\(self.cameraRemotePath) \(self.cameraRemotePath).meta; "
+                              + CaptureOrchestrator.restorePowerCommand()) { _ in }
                     self.composeOffline(screenURL: screenURL, cameraURL: cameraURL,
                                         outputURL: outputURL,
                                         screenMeta: screenMeta, cameraMeta: cameraMeta)

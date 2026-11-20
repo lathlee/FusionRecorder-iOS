@@ -83,9 +83,19 @@ final class CaptureOrchestrator: ObservableObject {
     static let cameraMP4Path = cameraMP4Dir + "/fusion_camera.mp4"
     static let screenStopFlag = "/data/local/tmp/fusion_stop_screen"
 
-    /// 录制前的准备：确保相机目录存在、清掉上次的停止标记。
+    /// 录制前的准备：确保相机目录存在、清掉上次的停止标记、把屏幕叫醒并保持常亮。
+    /// 屏幕路是 SurfaceControl 虚拟屏镜像，屏一黑就没有任何新帧，
+    /// 录出来的 mp4 会几乎全是静止帧（这也是 0.3.x「屏幕冻结」的诱因之一）。
     static func prepareRecordCommand() -> String {
-        "mkdir -p \(cameraMP4Dir); rm -f \(screenStopFlag)"
+        "mkdir -p \(cameraMP4Dir); rm -f \(screenStopFlag); "
+            + "input keyevent KEYCODE_WAKEUP; "
+            + "settings put system screen_off_timeout 1800000; "
+            + "svc power stayon true"
+    }
+
+    /// 录制结束恢复：取消常亮保持（超时值保持 30 分钟，避免反复改写用户设置）
+    static func restorePowerCommand() -> String {
+        "svc power stayon false"
     }
 
     /// 屏幕流：shell uid 的 app_process 本地录 mp4。参数槽位：
