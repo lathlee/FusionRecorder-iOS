@@ -105,7 +105,10 @@ class FakeAdbd(threading.Thread):
                         service = payload.rstrip(b"\0").decode(errors="replace")
                         self.transcript.append("OPEN:" + service)
                         stream_remote += 1
-                        conn.sendall(packet(OKAY, arg0, stream_remote))
+                        # 真 adbd 语义：OKAY(arg0=设备remoteId, arg1=客户端localId echo)
+                        # 之前写反成 (arg0=localId, arg1=remoteId)，掩盖了 ADBClient 的
+                        # remoteId 取错 bug（sync push 超时）。2026-11-20 真机实测修正。
+                        conn.sendall(packet(OKAY, stream_remote, arg0))
                         if service.startswith("shell:"):
                             self._handle_shell(conn, service[6:], arg0, stream_remote)
                         elif service == "sync:":
@@ -135,27 +138,48 @@ class FakeAdbd(threading.Thread):
         conn.sendall(packet(CLSE, remote_id, local_id))
 
     def _handle_sync(self, conn, local_id, remote_id, initial):
-        # 先读 SEND/DATA/DONE，回 OKAY。为简化，循环收到 DONE 就回。
-        buf = initial
+        # 真机协议：sync 帧(SEND/DATA/DONE)包在 ADB WRTE 包里发来，
+        # WRTE.arg1 必须 = 设备分配的 remote_id。之前 mock 直接读裸 sync 帧，
+        # 没校验 arg1，掩盖了 ADBClient 把 remoteId 取成 arg1 的 bug。
+        # 2026-11-20 修正：按 ADBPacket 解包并严格校验。
+        adb_buf = initial
+        sync_buf = bytearray()
         seen = []
+        bad_remote = False
         while True:
             chunk = conn.recv(65536)
             if not chunk:
                 break
-            buf += chunk
-            while len(buf) >= 8:
-                sid = buf[:4]
-                length = struct.unpack_from("<I", buf, 4)[0]
-                if len(buf) < 8 + length:
+            adb_buf += chunk
+            while len(adb_buf) >= 24:
+                cmd, a0, a1, ln, cs, mg = struct.unpack_from("<IIIIII", adb_buf)
+                if len(adb_buf) < 24 + ln:
                     break
-                payload = buf[8:8 + length]
-                buf = buf[8 + length:]
+                payload = adb_buf[24:24 + ln]
+                adb_buf = adb_buf[24 + ln:]
+                if cmd != WRTE:
+                    continue
+                if a1 != remote_id:
+                    bad_remote = True
+                    self.transcript.append("SYNC_WRTE_BAD_ARG1(%d!=%d)" % (a1, remote_id))
+                sync_buf += payload
+            while len(sync_buf) >= 8:
+                sid = bytes(sync_buf[:4])
+                length = struct.unpack_from("<I", sync_buf, 4)[0]
+                if len(sync_buf) < 8 + length:
+                    break
+                spayload = bytes(sync_buf[8:8 + length])
+                del sync_buf[:8 + length]
                 if sid == b"SEND":
-                    seen.append("SEND:" + payload.decode())
+                    seen.append("SEND:" + spayload.decode(errors="replace"))
                 elif sid == b"DATA":
                     seen.append("DATA:%d" % length)
                 elif sid == b"DONE":
                     seen.append("DONE:%d" % length)
+                    if bad_remote:
+                        self.transcript.append("sync BAD_REMOTE " + ",".join(seen))
+                        conn.close()
+                        return                       # 模拟真 adbd 断开
                     self.transcript.append("sync " + ",".join(seen))
                     conn.sendall(sync_frame(b"OKAY"))
                     return
@@ -202,7 +226,8 @@ def test_auth_and_shell(port, transcript):
     c.send(OPEN, 0x10000001, 0, b"shell:id\0")
     cmd, a0, a1, payload = c.recv_one()
     assert cmd == OKAY
-    remote = a1
+    remote = a0                        # 真机语义：OKAY.arg0 = 设备 remoteId
+    assert a1 == 0x10000001, "OKAY.arg1 应是客户端 localId echo"
     output = b""
     cmd, a0, a1, payload = c.recv_one()
     while cmd == WRTE:
@@ -229,13 +254,18 @@ def test_sync_push(port, transcript):
     c.send(OPEN, 0x20000001, 0, b"sync:\0")
     cmd, a0, a1, payload = c.recv_one()
     assert cmd == OKAY
-    remote = a1
+    # 真机语义：OKAY.arg0 = 设备 remoteId（WRTE.arg1 要用它）；
+    # OKAY.arg1 = 客户端 localId echo。取错会导致真 adbd 断开。
+    remote = a0
+    local = 0x20000001
+    assert a1 == local, "OKAY.arg1 应是客户端 localId echo"
 
-    # 模拟 ADBSyncPusher.sendFrames：SEND + 2×DATA + DONE
-    c.sock.sendall(sync_frame(b"SEND", b"/data/local/tmp/screen-push.jar,0644"))
-    c.sock.sendall(sync_frame(b"DATA", b"hello"))
-    c.sock.sendall(sync_frame(b"DATA", b"world"))
-    c.sock.sendall(sync_frame(b"DONE", struct.pack("<I", 1700000000)))
+    # 模拟 ADBClient.push + ADBSyncPusher：每帧包成一个 ADB WRTE(local, remote, frame)
+    for frame in (sync_frame(b"SEND", b"/data/local/tmp/screen-push.jar,0644"),
+                  sync_frame(b"DATA", b"hello"),
+                  sync_frame(b"DATA", b"world"),
+                  sync_frame(b"DONE", struct.pack("<I", 1700000000))):
+        c.send(WRTE, local, remote, frame)
     # 读 sync OKAY（8 字节，不走 ADBPacket）
     resp = c.sock.recv(8)
     assert resp[:4] == b"OKAY", "DONE 后应收到 sync OKAY"

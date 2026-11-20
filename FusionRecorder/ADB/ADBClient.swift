@@ -267,11 +267,18 @@ final class ADBClient {
             resolveConnect(.success(()))
 
         case ADBPacket.OKAY:
-            // OPEN 的确认：arg0 = 客户端 localId，arg1 = 设备 remoteId
-            if let stream = streams[packet.arg0], stream.remoteId == nil {
-                stream.remoteId = packet.arg1
-                log?("stream \(packet.arg1) 已就绪 (\(stream.service))")
-                stream.onOpened?(packet.arg0)
+            // OPEN 的确认（真机 adbd 语义，2026-11-20 实测确认）：
+            //   arg0 = 设备分配的 remoteId（后续 WRTE/CLSE 的 arg1 要用它）
+            //   arg1 = 客户端 localId 的 echo（用它找 stream）
+            // 之前写反成 arg0=localId/arg1=remoteId，导致 sync push 时
+            // WRTE 的 arg1 填成自己的 localId，真 adbd 直接断开连接 →
+            // "push 屏幕流 dex 失败: ADB 操作超时"。shell 只被动收 WRTE 不受影响，
+            // 所以之前没暴露。mock adbd 也写反了，离线自测 3/3 也没抓到。
+            let localId = packet.arg1
+            if let stream = streams[localId], stream.remoteId == nil {
+                stream.remoteId = packet.arg0
+                log?("stream \(packet.arg0) 已就绪 (\(stream.service))")
+                stream.onOpened?(localId)
             }
 
         case ADBPacket.WRTE:
