@@ -335,7 +335,7 @@ final class RecorderSession: ObservableObject {
     private func composeOffline(screenURL: URL, cameraURL: URL, outputURL: URL) {
         setPhase(.composing, "离线合成中（两路按绝对 pts 对齐，按短的那路裁剪）…")
         let params = self.params
-        DispatchQueue.global(qos: .userInitiated) { [weak self] in
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
             do {
                 let result = try OfflineCompositor.compose(
