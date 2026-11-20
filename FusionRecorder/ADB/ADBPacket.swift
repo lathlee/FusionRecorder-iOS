@@ -20,6 +20,8 @@ struct ADBPacket {
     static let OKAY: UInt32 = 0x59414b4f
     static let WRTE: UInt32 = 0x45545257
     static let CLSE: UInt32 = 0x45534c43
+    /// 0.4.0 离线架构：sync RECV（从眼镜拉两个本地 mp4）
+    static let RECV: UInt32 = 0x56434552
 
     static let authToken: UInt32 = 1
     static let authSignature: UInt32 = 2

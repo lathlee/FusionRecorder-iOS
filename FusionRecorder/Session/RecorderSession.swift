@@ -2,18 +2,16 @@
 //  RecorderSession.swift
 //  FusionRecorder
 //
-//  把 ADB + 双路流 + 唯一合成器 + 成片写入串起来，并给 SwiftUI 提供状态。
+//  离线录制架构（0.4.0）—— 全流程：
+//    发现眼镜 → ADB 部署采集端 → 眼镜本地双路录 mp4 → iPhone 只计时
+//    → 停止后 ADB pull 两个 mp4 → iPhone 离线合成 → 写片存相册
 //
-//  ★ 预览 / 抓帧 / 录制 三条路径都指向同一个 FusionCompositor：
-//    · 预览：FrameStore 的两张真实帧 → FusionCompositor（FusionPreview 负责显示）
-//    · 抓帧：9114 / 9115 各解一帧 → 存进 FrameStore → 立刻成为新的预览源
-//    · 录制：双路实时帧 + 真实 pts → 帧队列锚点对齐 → RecordingCompositor → MovieWriter
-//  参数统一由 ContentView 组装成 FusionParams 后 update 进来，不存在两套数值。
+//  为什么改：0.3.x 实时推流下，两路 H264 走 WiFi TCP，链路一抖动两路同时停推，
+//  旧写帧策略继续写旧帧 → 屏幕/相机同时冻结。把录制搬到眼镜本地后，
+//  编码与 muxer 不依赖网络，从根上消除这个故障模式。
 //
-//  v0.2 pts 对齐（与 PROTOCOL.md §6 一致）：
-//    两路帧率不同（20/30fps），不能按帧号配对。每路维护 (pts, CGImage) 队列，
-//    以 t0 = min(两路首帧 pts) 为零点，按 20fps 生成目标时刻，
-//    每路取「pts 不晚于目标时刻的最后一帧」送合成器 —— 静止画面自然重复上一帧。
+//  对齐规则：两路 mp4 的 pts 都来自眼镜 SystemClock.elapsedRealtimeNanos()/1000，
+//  同一时基；OfflineCompositor 取 max(两路首帧) → 任一路读完（按短的那路）。
 //
 
 import Foundation
@@ -21,462 +19,373 @@ import Combine
 import CoreGraphics
 import UIKit
 
-/// 一路带时间戳的帧队列。只保留最近若干帧，按 pts 升序（采集端写 TCP 即时间戳）。
-private final class TimedFrameQueue {
-    private var frames: [(pts: Int64, image: CGImage)] = []
-    private let capacity = 300          // 15 秒 @20fps，足够应对抖动
-
-    func append(pts: Int64, image: CGImage) {
-        frames.append((pts, image))
-        if frames.count > capacity {
-            frames.removeFirst(frames.count - capacity)
-        }
-    }
-
-    /// pts 不晚于 target 的最后一帧。没有更早帧时退回第一帧。
-    func anchor(before target: Int64) -> (image: CGImage, pts: Int64)? {
-        guard let first = frames.first else { return nil }
-        var chosen = first
-        for f in frames {
-            if f.pts <= target { chosen = f } else { break }
-        }
-        return (chosen.image, chosen.pts)
-    }
-
-    /// 队列里最新一帧（0.3.8 起合成直接用它，不再用墙钟锚点取旧帧）
-    var latest: (image: CGImage, pts: Int64)? { frames.last.map { ($0.image, $0.pts) } }
-    var firstPTS: Int64? { frames.first?.pts }
-    var lastPTS: Int64? { frames.last?.pts }
-    var isEmpty: Bool { frames.isEmpty }
-    func clear() { frames.removeAll() }
+enum OfflinePhase: String {
+    case idle = "待机"
+    case deploying = "部署采集端"
+    case recording = "录制中"
+    case stopping = "收尾写文件"
+    case pulling = "传输文件"
+    case composing = "离线合成"
+    case saving = "保存相册"
 }
 
 final class RecorderSession: ObservableObject {
 
     @Published private(set) var isRunning = false
     @Published private(set) var log: [String] = []
-    @Published private(set) var screenNALCount = 0
-    @Published private(set) var cameraNALCount = 0
-    /// 录制中的实时合成帧（就是成片里正在写的那一帧，只是缩小显示）
-    @Published private(set) var livePreview: CGImage?
     @Published private(set) var captureState = "未抓帧"
     @Published private(set) var captureInProgress = false
-    /// v0.2：成片已写好的通知（URL 为相册里的临时 mp4，已同步到相册）
     @Published private(set) var finishedMovieURL: URL?
     @Published private(set) var recordError: String?
-    /// 已写入帧数（UI 录制页显示）
+
+    // ---- 离线流程状态 ----
+    @Published private(set) var offlinePhase: OfflinePhase = .idle
+    @Published private(set) var offlineProgress: Double = 0
+    @Published private(set) var phaseDetail = ""
+    /// 录制已用秒数（离线阶段 UI 只给计时，没有实时预览）
+    @Published private(set) var recordingElapsed: Int = 0
+    /// 合成进度用的已写帧数
     @Published private(set) var recordedFrameCount: Int = 0
 
     func clearRecordResult() {
         finishedMovieURL = nil
         recordError = nil
+        offlineProgress = 0
+        phaseDetail = ""
+        recordedFrameCount = 0
     }
 
-    /// UI 侧追加一条可见日志（保留了时间戳格式）
     func appendUser(_ line: String) { append(line) }
 
-    /// 抓到的真实帧交给它保存，随后自动成为预览源
+    /// 抓帧预览源（离线录制不依赖它，保留供参数预览对照）
     weak var frameStore: FrameStore?
 
     private let recordingCompositor = RecordingCompositor(params: FusionParams())
-    private var screenDecoder = H264FrameDecoder()
-    // 眼镜摄像头 sensor orientation=180，采集端输出倒像；相机流解码后旋转补正。
-    // 屏幕流不需要旋转。抓帧预览与录制共用同一 decoder 配置，保证"预览=成片"。
-    private var cameraDecoder = H264FrameDecoder(rotation: 180)
-
-    /// 全自动部署编排器（发现 → ADB → push → 启动两路）
-    /// 由 ContentView 注入并共用同一实例，便于 UI 观察状态
     var orchestrator = CaptureOrchestrator()
 
     private var adb: ADBClient?
-    private var screenReceiver: H264StreamReceiver?
-    private var cameraReceiver: H264StreamReceiver?
-    /// 全自动模式：采集端主动连 iPhone，用监听端（与上面的客户端并存）
-    private var screenListener: H264StreamListener?
-    private var cameraListener: H264StreamListener?
+    private var timer: DispatchSourceTimer?
+    private var timerQueue = DispatchQueue(label: "com.lath.fusionrecorder.timer")
+    private var recordStartDate: Date?
 
+    // 远端与本地文件路径
+    private let screenRemotePath = "/data/local/tmp/fusion_screen.mp4"
+    private let cameraRemotePath = "/data/local/tmp/fusion_camera.mp4"
+    private var screenLocalURL: URL?
+    private var cameraLocalURL: URL?
+    private var outputLocalURL: URL?
+
+    private var pullScreenProgress: Double = 0
+    private var pullCameraProgress: Double = 0
+
+    /// 抓帧用的旧解码器（参数预览/调试用；离线录制路径不调用）
     private var captureScreenReceiver: H264StreamReceiver?
     private var captureCameraReceiver: H264StreamReceiver?
     private var captureScreenDecoder = H264FrameDecoder()
     private var captureCameraDecoder = H264FrameDecoder(rotation: 180)
-
-    private let frameLock = NSLock()
-    private var liveScreen: CGImage?
-    private var liveCamera: CGImage?
     private var capturedScreen: CGImage?
     private var capturedCamera: CGImage?
+    private let frameLock = NSLock()
 
-    // ---- v0.2：pts 对齐帧队列 + CFR 定时输出 + 成片写入 ----
-    private var screenQueue = TimedFrameQueue()
-    private var cameraQueue = TimedFrameQueue()
-    private var movieWriter: MovieWriter?
-    private var cfrTimer: DispatchSourceTimer?
-    private let cfrQueue = DispatchQueue(label: "com.lath.fusionrecorder.cfr")
-    private var timelineOriginUs: Int64?
-    /// 建立时间零点那一刻的真实墙钟（微秒），仅用于诊断"真实经过时间 vs 已写帧数"。
-    /// 0.3.6 曾让成片 pts 直接跟随墙钟，反而造成播放观感卡顿；0.3.7 起写帧 pts
-    /// 回归「帧序号 × 50ms」，恒定 20fps，容器层时长不再缩水。
-    private var wallClockBaseUs: Int64?
-    private var outputFrameIndex: Int64 = 0
-    private let outputFPS: Int64 = 20
-
-    // ★ 合成与写帧解耦（0.3.8 修正）：
-    // 0.3.7 把合成挂在「每来一个 NAL 就 scheduleCompose」上，并用 composePending 去重：
-    // 合成耗时一旦超过帧间隔，合成期间到达的帧触发全被吞掉；而 tickCFR 的
-    // 「落后 300ms 才催」条件又几乎永不成立 → latestComposed 长时间不更新，
-    // 写帧线程 20fps 反复写同一张旧图（实测 30→36s 画面差异仅 0.02%）。
-    // 0.3.8 改为两个独立 20fps 定时器：
-    //   · 合成定时器：固定频率取「两路最新帧」合成，结果存 latestComposed
-    //   · 写帧定时器：每 50ms 只做「取最新合成帧 → append」，绝不在写帧线程合成
-    // 合成再慢也只是"画面更新滞后"，不会再饿死，也不会拖垮写帧节奏。
-    private let composeQueue = DispatchQueue(label: "com.lath.fusionrecorder.compose")
-    private var composeTimer: DispatchSourceTimer?
-    private let composedLock = NSLock()
-    private var latestComposed: CGImage?
-    private var composeCount: Int64 = 0
-
-    // 诊断计数（frameLock 保护）：每 2 秒由写帧线程打印，区分「流停了」与「合成停了」
-    private var diagScreenNAL: Int64 = 0
-    private var diagCameraNAL: Int64 = 0
-    private var lastDiagScreenNAL: Int64 = 0
-    private var lastDiagCameraNAL: Int64 = 0
-
-    /// 单调墙钟微秒（DispatchTime，不受系统时间调整影响）
-    private static func nowWallUs() -> Int64 {
-        Int64(DispatchTime.now().uptimeNanoseconds / 1_000)
+    private static func nowStamp() -> String {
+        String(Int(Date().timeIntervalSince1970))
     }
 
-    /// UI 在每次参数变化时调用，保证录制用的就是预览里那组数值
     func update(params: FusionParams) {
         recordingCompositor.update(params)
     }
 
     var params: FusionParams { recordingCompositor.currentParams }
 
-    // MARK: - 录制
-
-    /// 手动模式：iPhone 主动连眼镜（眼镜端是 server）。用于老 PoC / 抓帧对照。
-    func start(host: String, screenPort: UInt16, cameraPort: UInt16) {
-        beginPipeline(screenPort: screenPort, cameraPort: cameraPort, listen: false, host: host)
-        // 手动模式也尝试 ADB 握手（老流程：只连不部署）
-        let client = ADBClient(host: host, port: 5555)
-        client.log = { [weak self] message in self?.append("[ADB] \(message)") }
-        adb = client
-        client.connect { [weak self] result in
-            switch result {
-            case .success: self?.append("ADB 握手完成")
-            case .failure(let error): self?.append("ADB 连接失败：\(error.localizedDescription)（流仍可单独接收）")
-            }
+    private func setPhase(_ phase: OfflinePhase, _ detail: String) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.offlinePhase = phase
+            self.phaseDetail = detail
+            self.append(detail)
         }
     }
 
-    /// 全自动模式：先部署眼镜端，再让 iPhone 监听 9114/9115 等采集端主动接入。
+    // MARK: - 开始（对外保留 startAuto 签名，内部走离线）
+
+    /// 手动入口：host 直接给眼镜 IP，仍走离线录制。
+    func start(host: String, screenPort: UInt16, cameraPort: UInt16) {
+        startOffline(host: host, iphoneHostIP: nil) { _ in }
+    }
+
+    /// 全自动入口：部署 → 本地录制 → 计时。端口参数保留兼容，离线不使用。
     func startAuto(host: String? = nil, iphoneHostIP: String? = nil,
                    screenPort: UInt16 = 9114, cameraPort: UInt16 = 9115,
                    completion: @escaping (Result<Void, Error>) -> Void) {
-        guard !isRunning else {
-            completion(.failure(ADBError.connectionFailed("正在录制中")))
+        startOffline(host: host, iphoneHostIP: iphoneHostIP, completion: completion)
+    }
+
+    private func startOffline(host: String?, iphoneHostIP: String?,
+                              completion: @escaping (Result<Void, Error>) -> Void) {
+        guard !isRunning, offlinePhase == .idle || offlinePhase == .saving else {
+            completion(.failure(ADBError.connectionFailed("正在录制或收尾中")))
             return
         }
-        append("全自动：发现眼镜 → 部署采集端 → 监听两路 → 录制写相册")
+        clearRecordResult()
+        setPhase(.deploying, "离线架构：部署采集端（眼镜本地录两路 mp4）")
+
         orchestrator.run(host: host, iphoneHostIP: iphoneHostIP) { [weak self] result in
             guard let self = self else { return }
             switch result {
             case .failure(let error):
+                self.setPhase(.idle, "部署失败")
                 completion(.failure(error))
             case .success(let message):
                 self.append("部署完成：\(message)")
-                // 采集端已下发启动命令，立刻开监听；采集端会主动连过来
-                self.beginPipeline(screenPort: screenPort, cameraPort: cameraPort,
-                                   listen: true, host: nil)
-                completion(.success(()))
+                self.connectAndStartRecording(completion: completion)
             }
         }
     }
 
-    /// 管线公共部分：解码器 / 帧队列 / writer / CFR；两种模式只差接收方式。
-    private func beginPipeline(screenPort: UInt16, cameraPort: UInt16,
-                               listen: Bool, host: String?) {
-        guard !isRunning else { return }
-        isRunning = true
-        livePreview = nil
-        finishedMovieURL = nil
-        recordError = nil
-        recordedFrameCount = 0
-        append("启动：\(listen ? "监听" : "连接") 屏幕 \(screenPort) / 相机 \(cameraPort)")
-        append("合成参数：\(params.fingerprint)")
-        append("v0.3：pts 锚点对齐，\(outputFPS)fps CFR 输出，成片写相册")
-
-        // 成片分辨率 = 合成画布 = 预览画布（三者同一份 FusionParams）
-        let size = params.renderSize
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("fusion_rec_\(Int(Date().timeIntervalSince1970)).mp4")
-        let writer = MovieWriter(width: size.width, height: size.height)
-        do {
-            try writer.start(outputURL: url)
-            movieWriter = writer
-            append("编码器就绪：\(size.width)×\(size.height) / H264 / \(outputFPS)fps")
-        } catch {
-            recordError = "编码器启动失败：\(error.localizedDescription)"
-            append(recordError!)
-            isRunning = false
+    /// 部署完成后另建一条 ADB 连接，专管停止/pull（职责与 orchestrator 分开）。
+    private func connectAndStartRecording(completion: @escaping (Result<Void, Error>) -> Void) {
+        guard let glassesIP = orchestrator.glassesIP else {
+            let e = ADBError.connectionFailed("拿不到眼镜 IP")
+            setPhase(.idle, "失败")
+            completion(.failure(e))
             return
         }
-
-        screenDecoder = H264FrameDecoder()
-        cameraDecoder = H264FrameDecoder(rotation: 180)
-        frameLock.lock()
-        screenQueue.clear()
-        cameraQueue.clear()
-        timelineOriginUs = nil
-        wallClockBaseUs = nil
-        outputFrameIndex = 0
-        frameLock.unlock()
-        composedLock.lock()
-        latestComposed = nil
-        composeCount = 0
-        composedLock.unlock()
-        diagScreenNAL = 0
-        diagCameraNAL = 0
-        lastDiagScreenNAL = 0
-        lastDiagCameraNAL = 0
-        liveScreen = nil
-        liveCamera = nil
-
-        let onScreenNAL: (Data) -> Void = { [weak self] nal in
-            self?.bumpScreen()
-            self?.handleLive(nal, isScreen: true)
+        let client = ADBClient(host: glassesIP, port: 5555)
+        client.log = { [weak self] message in self?.append("[ADB] \(message)") }
+        client.connect { [weak self] result in
+            guard let self = self else { return }
+            switch result {
+            case .failure(let error):
+                self.setPhase(.idle, "失败")
+                completion(.failure(error))
+            case .success:
+                self.adb = client
+                self.append("ADB 已连接 \(glassesIP)，启动眼镜本地录制")
+                // 清掉上一次残留的停止标记
+                client.shell(CaptureOrchestrator.cleanStopFlagCommand()) { [weak self] _ in
+                    guard let self = self else { return }
+                    let screenCmd = CaptureOrchestrator.screenRecordStartCommand()
+                    guard CaptureOrchestrator.isSafeCommand(screenCmd) else {
+                        completion(.failure(ADBError.connectionFailed("屏幕录制命令非法")))
+                        return
+                    }
+                    // 屏幕录制是长驻进程，用 shellDetached 保持通道
+                    client.shellDetached(screenCmd) { [weak self] screenResult in
+                        guard let self = self else { return }
+                        switch screenResult {
+                        case .failure(let error):
+                            self.setPhase(.idle, "失败")
+                            completion(.failure(error))
+                            return
+                        case .success:
+                            self.append("屏幕本地录制已启动 → \(self.screenRemotePath)")
+                        }
+                        let cameraCmd = CaptureOrchestrator.cameraRecordStartCommand()
+                        guard CaptureOrchestrator.isSafeCommand(cameraCmd) else {
+                            completion(.failure(ADBError.connectionFailed("相机录制命令非法")))
+                            return
+                        }
+                        client.shell(cameraCmd, timeout: 30) { [weak self] cameraResult in
+                            guard let self = self else { return }
+                            switch cameraResult {
+                            case .failure(let error):
+                                self.setPhase(.idle, "失败")
+                                completion(.failure(error))
+                            case .success(let output):
+                                self.append("相机本地录制已启动 → \(self.cameraRemotePath) "
+                                            + output.trimmingCharacters(in: .whitespacesAndNewlines))
+                                self.markRecordingStarted()
+                                completion(.success(()))
+                            }
+                        }
+                    }
+                }
+            }
         }
-        let onCameraNAL: (Data) -> Void = { [weak self] nal in
-            self?.bumpCamera()
-            self?.handleLive(nal, isScreen: false)
-        }
-
-        if listen {
-            // 全自动：眼镜主动连过来
-            let sl = H264StreamListener(port: screenPort, label: "screen",
-                onNAL: onScreenNAL,
-                onState: { [weak self] message in self?.append("[屏幕/监听] \(message)") })
-            let cl = H264StreamListener(port: cameraPort, label: "camera",
-                onNAL: onCameraNAL,
-                onState: { [weak self] message in self?.append("[相机/监听] \(message)") })
-            screenListener = sl
-            cameraListener = cl
-            sl.start()
-            cl.start()
-        } else if let host = host {
-            // 手动：iPhone 主动连眼镜
-            let screen = H264StreamReceiver(host: host, port: screenPort, label: "screen",
-                onNAL: onScreenNAL,
-                onState: { [weak self] message in self?.append("[屏幕] \(message)") })
-            let camera = H264StreamReceiver(host: host, port: cameraPort, label: "camera",
-                onNAL: onCameraNAL,
-                onState: { [weak self] message in self?.append("[相机] \(message)") })
-            screenReceiver = screen
-            cameraReceiver = camera
-            screen.start()
-            camera.start()
-        }
-
-        startComposeTimer()
-        startCFRTimer()
     }
+
+    private func markRecordingStarted() {
+        let stamp = Self.nowStamp()
+        let tmp = FileManager.default.temporaryDirectory
+        screenLocalURL = tmp.appendingPathComponent("fusion_screen_\(stamp).mp4")
+        cameraLocalURL = tmp.appendingPathComponent("fusion_camera_\(stamp).mp4")
+        outputLocalURL = tmp.appendingPathComponent("fusion_rec_\(stamp).mp4")
+        pullScreenProgress = 0
+        pullCameraProgress = 0
+        recordStartDate = Date()
+        recordingElapsed = 0
+        isRunning = true
+        setPhase(.recording, "眼镜正在本地录制两路 mp4；录制完点停止，会自动传输并合成")
+        startTimer()
+    }
+
+    private func startTimer() {
+        timer?.cancel()
+        let t = DispatchSource.makeTimerSource(queue: timerQueue)
+        t.schedule(deadline: .now() + 1, repeating: 1.0)
+        t.setEventHandler { [weak self] in
+            guard let self = self, let start = self.recordStartDate else { return }
+            let sec = Int(Date().timeIntervalSince(start))
+            DispatchQueue.main.async { self.recordingElapsed = sec }
+        }
+        t.resume()
+        timer = t
+    }
+
+    private func stopTimer() {
+        timer?.cancel()
+        timer = nil
+        recordStartDate = nil
+    }
+
+    // MARK: - 停止 → 收尾 → pull → 合成
 
     func stop() {
-        guard isRunning else { return }
+        guard isRunning, let adb = adb else { return }
         isRunning = false
-        stopComposeTimer()
-        stopCFRTimer()
+        stopTimer()
+        setPhase(.stopping, "通知眼镜写完两个 mp4…")
 
-        screenReceiver?.stop()
-        cameraReceiver?.stop()
-        screenListener?.stop()
-        cameraListener?.stop()
-        screenListener = nil
-        cameraListener = nil
-        // 通知眼镜端停相机流（屏幕流靠 TCP 断开，心跳最多 1 秒感知）
-        orchestrator.stop { [weak self] in
-            self?.append("已通知眼镜端停止采集")
+        // 屏幕：touch 标记；相机：带 STOP action 再 start 一次服务，
+        // 让 worker 走 signalEndOfInputStream + drain EOS + muxer.stop()
+        adb.shell(CaptureOrchestrator.stopScreenRecordCommand()) { [weak self] _ in
+            guard let self = self else { return }
+            adb.shell(CaptureOrchestrator.stopCameraRecordCommand(), timeout: 20) { [weak self] _ in
+                guard let self = self else { return }
+                self.waitFilesThenPull(adb: adb)
+            }
         }
-        adb?.disconnect()
-        screenDecoder.invalidate()
-        cameraDecoder.invalidate()
+    }
 
-        frameLock.lock()
-        liveScreen = nil
-        liveCamera = nil
-        screenQueue.clear()
-        cameraQueue.clear()
-        frameLock.unlock()
+    /// 轮询两个文件大小，连续两次一致且非零才算写完（最多约 10 秒）。
+    private func waitFilesThenPull(adb: ADBClient) {
+        let command = CaptureOrchestrator.waitFilesCommand()
+        adb.shell(command, timeout: 25) { [weak self] result in
+            guard let self = self else { return }
+            switch result {
+            case .failure(let error):
+                self.fail("等待文件写完失败：\(error.localizedDescription)")
+            case .success(let output):
+                let text = output.trimmingCharacters(in: .whitespacesAndNewlines)
+                self.append("文件就绪检查：\(text)")
+                guard text.contains("READY") else {
+                    self.fail("眼镜端 mp4 未写完或为空：\(text)")
+                    return
+                }
+                self.pullFiles(adb: adb)
+            }
+        }
+    }
 
-        guard let writer = movieWriter, writer.writtenFrames > 0 else {
-            movieWriter?.cancel()
-            movieWriter = nil
-            append("已停止（没有可写入的帧）")
-            // 必须通知 UI：否则 ContentView 的 isFinishing 靠 recordError/finishedMovieURL
-            // 的 onChange 退出，两者都不变就永远卡在「正在封装成片并保存相册」。
-            let msg = "没有收到可写入的帧：确认眼镜两路流都已接入（9114/9115）、屏幕点亮，再点「全自动录制」"
-            recordError = msg
-            append(msg)
+    private func pullFiles(adb: ADBClient) {
+        guard let screenURL = screenLocalURL,
+              let cameraURL = cameraLocalURL,
+              let outputURL = outputLocalURL else {
+            fail("本地路径未初始化")
             return
         }
-        append("正在封装成片（\(writer.writtenFrames) 帧）…")
-        writer.finish { [weak self] result in
-            DispatchQueue.main.async {
+        setPhase(.pulling, "传输屏幕 mp4（0%）…")
+
+        adb.pull(path: screenRemotePath, progress: { [weak self] ratio in
+            guard let self = self else { return }
+            self.pullScreenProgress = ratio
+            self.updatePullProgress()
+        }) { [weak self] result in
+            guard let self = self else { return }
+            switch result {
+            case .failure(let error):
+                self.fail("拉取屏幕 mp4 失败：\(error.localizedDescription)")
+                return
+            case .success(let data):
+                do { try data.write(to: screenURL) }
+                catch { self.fail("保存屏幕 mp4 失败：\(error.localizedDescription)"); return }
+                self.append("屏幕 mp4 已拉取（\(data.count) 字节）")
+            }
+
+            DispatchQueue.main.async { self.phaseDetail = "传输相机 mp4（0%）…" }
+            adb.pull(path: cameraRemotePath, progress: { [weak self] ratio in
                 guard let self = self else { return }
-                switch result {
-                case .success(let url):
-                    self.finishedMovieURL = url
-                    self.append("成片已保存到相册：\(url.lastPathComponent)")
+                self.pullCameraProgress = ratio
+                self.updatePullProgress()
+            }) { [weak self] cameraResult in
+                guard let self = self else { return }
+                switch cameraResult {
                 case .failure(let error):
-                    self.recordError = error.localizedDescription
-                    self.append("成片失败：\(error.localizedDescription)")
+                    self.fail("拉取相机 mp4 失败：\(error.localizedDescription)")
+                    return
+                case .success(let data):
+                    do { try data.write(to: cameraURL) }
+                    catch { self.fail("保存相机 mp4 失败：\(error.localizedDescription)"); return }
+                    self.append("相机 mp4 已拉取（\(data.count) 字节）")
                 }
-                self.movieWriter = nil
+                // 远端文件拉完即可删，避免眼镜存储越积越多
+                adb.shell("rm -f \(self.screenRemotePath) \(self.cameraRemotePath)") { _ in }
+                self.composeOffline(screenURL: screenURL, cameraURL: cameraURL,
+                                    outputURL: outputURL)
             }
         }
     }
 
-    /// 每来一个 NAL：解出帧 → 带 pts 入对应队列。
-    /// ★ 0.3.8：这里只解码入队，合成完全交给独立 composeTimer，绝不在 NAL 路径触发合成。
-    private func handleLive(_ nal: Data, isScreen: Bool) {
-        let decoder = isScreen ? screenDecoder : cameraDecoder
-        guard let result = decoder.feedWithPTS(nal) else { return }
-
-        frameLock.lock()
-        if isScreen {
-            screenQueue.append(pts: result.ptsUs, image: result.image)
-            liveScreen = result.image
-            diagScreenNAL += 1
-        } else {
-            cameraQueue.append(pts: result.ptsUs, image: result.image)
-            liveCamera = result.image
-            diagCameraNAL += 1
-        }
-        // t0 = 两路都有帧后，取两路首帧中较早者（PROTOCOL.md §6）
-        if timelineOriginUs == nil {
-            if let s = screenQueue.firstPTS, let c = cameraQueue.firstPTS {
-                timelineOriginUs = min(s, c)
-                wallClockBaseUs = Self.nowWallUs()
-                append("两路首帧 pts 差 \(abs(s - c)) μs，时间零点已建立")
-            }
-        }
-        frameLock.unlock()
+    private func updatePullProgress() {
+        let ratio = min(1.0, (pullScreenProgress + pullCameraProgress) / 2.0)
+        offlineProgress = ratio
+        phaseDetail = String(format: "传输 mp4（%.0f%%）…", ratio * 100)
     }
 
-    /// 独立合成定时器：固定 20fps 持续合成，彻底摆脱「NAL 到达才触发」的饿死问题。
-    /// 合成与写帧是两个独立定时器，各自 20fps，互不阻塞。
-    private func startComposeTimer() {
-        let timer = DispatchSource.makeTimerSource(queue: composeQueue)
-        timer.schedule(deadline: .now() + 0.05, repeating: .milliseconds(1000 / Int(outputFPS)))
-        timer.setEventHandler { [weak self] in self?.composeOnce() }
-        timer.resume()
-        composeTimer = timer
-    }
-
-    private func stopComposeTimer() {
-        composeTimer?.cancel()
-        composeTimer = nil
-    }
-
-    /// 在合成队列中做一次合成：取两路各自最新帧 → 合成 →
-    /// 结果同时更新 latestComposed（写帧用）与 livePreview（UI 用）。
-    /// ★ 0.3.8：不再用墙钟 targetUs 去 anchor —— 写帧 pts 已是「帧序号×50ms」，
-    /// 与流 pts 完全解耦，合成只需要视觉上最新的两路画面。旧做法在墙钟/流 pts
-    /// 稍有偏差时 anchor 会一直返回同一帧，正是画面冻结的直接原因。
-    private func composeOnce() {
-        guard isRunning else { return }
-        frameLock.lock()
-        let s = screenQueue.latest
-        let c = cameraQueue.latest
-        frameLock.unlock()
-        guard let s = s, let c = c else { return }
-        guard let composed = recordingCompositor.compose(screen: s.image, camera: c.image) else { return }
-
-        composedLock.lock()
-        latestComposed = composed
-        composeCount += 1
-        composedLock.unlock()
-        DispatchQueue.main.async { [weak self] in self?.livePreview = composed }
-    }
-
-    // MARK: - CFR 定时输出（20fps）
-
-    private func startCFRTimer() {
-        let timer = DispatchSource.makeTimerSource(queue: cfrQueue)
-        timer.schedule(deadline: .now() + 0.1, repeating: .milliseconds(1000 / Int(outputFPS)))
-        timer.setEventHandler { [weak self] in self?.tickCFR() }
-        timer.resume()
-        cfrTimer = timer
-    }
-
-    private func stopCFRTimer() {
-        cfrTimer?.cancel()
-        cfrTimer = nil
-    }
-
-    private func tickCFR() {
-        guard isRunning, let writer = movieWriter else { return }
-        frameLock.lock()
-        let origin = timelineOriginUs
-        let baseUs = wallClockBaseUs
-        let sEmpty = screenQueue.isEmpty
-        let cEmpty = cameraQueue.isEmpty
-        frameLock.unlock()
-        guard let t0 = origin, let base = baseUs, !sEmpty, !cEmpty else { return }
-
-        // ★ 写帧只做两件事：取最新合成帧 + append。绝不在这里合成。
-        // pts 用「帧序号 × 50ms」——写帧节奏恒定 20fps，成片时长 = 帧数/20。
-        composedLock.lock()
-        let composed = latestComposed
-        let cc = composeCount
-        composedLock.unlock()
-
-        let targetUs = t0 + outputFrameIndex * 1_000_000 / outputFPS
-        let elapsedUs = max(0, Self.nowWallUs() - base)
-
-        // 每 2 秒（40 帧）打印诊断：区分「采集流停了」与「合成停了」。
-        // 0.3.7 画面冻结时写帧仍在跑但 latestComposed 不更新，靠这行日志一锤定音。
-        if outputFrameIndex % 40 == 0 {
-            frameLock.lock()
-            let sn = diagScreenNAL, cn = diagCameraNAL
-            let sp = screenQueue.lastPTS, cp = cameraQueue.lastPTS
-            frameLock.unlock()
-            append(String(
-                format: "[诊断] %.1fs 屏幕NAL +%lld 相机NAL +%lld 累计合成 %lld 已写 %ld 屏幕pts尾 %@ 相机pts尾 %@",
-                Double(elapsedUs) / 1e6,
-                sn - lastDiagScreenNAL, cn - lastDiagCameraNAL, cc, writer.writtenFrames,
-                sp.map { String($0) } ?? "-", cp.map { String($0) } ?? "-"))
-            lastDiagScreenNAL = sn
-            lastDiagCameraNAL = cn
-        }
-        guard let composed = composed else { return }   // 首帧还没合成出来，本 tick 跳过
-
-        do {
-            try writer.append(frame: composed, presentationTimeUs: targetUs)
-            outputFrameIndex += 1
-            if outputFrameIndex % 20 == 0 {
-                DispatchQueue.main.async { [weak self] in
-                    self?.recordedFrameCount = Int(writer.writtenFrames)
+    private func composeOffline(screenURL: URL, cameraURL: URL, outputURL: URL) {
+        setPhase(.composing, "离线合成中（两路按绝对 pts 对齐，按短的那路裁剪）…")
+        let params = self.params
+        DispatchQueue.global(qos: .userInitiated) { [weak self] in
+            guard let self = self else { return }
+            do {
+                let result = try OfflineCompositor.compose(
+                    screenURL: screenURL,
+                    cameraURL: cameraURL,
+                    outputURL: outputURL,
+                    params: params) { ratio in
+                        DispatchQueue.main.async { [weak self] in
+                            guard let self = self else { return }
+                            self.offlineProgress = ratio
+                            self.phaseDetail = String(
+                                format: "离线合成中（%.0f%%）…", ratio * 100)
+                        }
+                    }
+                DispatchQueue.main.async {
+                    self.offlineProgress = 1
+                    self.setPhase(.idle, "完成")
+                    self.recordedFrameCount = result.frameCount
+                    self.finishedMovieURL = result.movieURL
+                    self.append("成片已保存相册：\(result.frameCount) 帧 / "
+                                + String(format: "%.1fs", Double(result.durationUs) / 1e6)
+                                + "（按短的那路裁剪）")
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.fail("离线合成失败：\(error.localizedDescription)")
                 }
             }
-            if outputFrameIndex % 40 == 0 {
-                append("已写 \(outputFrameIndex) 帧 / \(String(format: "%.1f", Double(elapsedUs) / 1e6))s")
-            }
-        } catch {
-            recordError = error.localizedDescription
-            append("写帧失败：\(error.localizedDescription)")
-            stop()
         }
     }
 
-    // MARK: - 从眼镜抓两帧（用户要求的真实预览源）
+    private func fail(_ message: String) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.isRunning = false
+            self.stopTimer()
+            self.offlinePhase = .idle
+            self.offlineProgress = 0
+            self.recordError = message
+            self.append(message)
+        }
+    }
+
+    // MARK: - 抓帧（旧调试入口，离线录制不依赖）
 
     func captureFrames(host: String, screenPort: UInt16, cameraPort: UInt16) {
         guard !captureInProgress else { return }
         captureInProgress = true
         captureState = "正在连接眼镜 9114 / 9115 并解第一帧…"
-        append("开始抓帧：\(host) 屏幕 \(screenPort) / 相机 \(cameraPort)")
+        append("抓帧：该入口属于实时推流调试，0.4.0 离线录制不依赖它")
 
         frameLock.lock()
         capturedScreen = nil
@@ -524,17 +433,12 @@ final class RecorderSession: ObservableObject {
             }
             return
         }
-        finishCapture(screen: s, camera: c)
-    }
-
-    private func finishCapture(screen: CGImage, camera: CGImage) {
         stopCaptureReceivers()
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
-            self.frameStore?.applyGlassesFrames(screen: screen, camera: camera)
+            self.frameStore?.applyGlassesFrames(screen: s, camera: c)
             self.captureInProgress = false
             self.captureState = "已从眼镜抓到两帧真实画面，预览已更新"
-            self.append("抓帧完成，预览源切换为眼镜实时帧")
         }
     }
 
@@ -544,13 +448,11 @@ final class RecorderSession: ObservableObject {
         let c = capturedCamera
         frameLock.unlock()
         guard s == nil || c == nil else { return }
-
         stopCaptureReceivers()
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
             self.captureInProgress = false
-            self.captureState = "抓帧超时：确认眼镜端推流服务已启动、IP/端口与 Wi-Fi 一致；也可先用相册导入两张真实图"
-            self.append("抓帧超时（屏幕帧 \(s == nil ? "无" : "有") / 相机帧 \(c == nil ? "无" : "有")）")
+            self.captureState = "抓帧超时（0.4.0 离线录制不需要实时推流，可直接开始录制）"
         }
     }
 
@@ -561,7 +463,7 @@ final class RecorderSession: ObservableObject {
         captureCameraReceiver = nil
     }
 
-    // MARK: - 日志 / 计数
+    // MARK: - 日志
 
     private func append(_ line: String) {
         DispatchQueue.main.async { [weak self] in
@@ -569,20 +471,6 @@ final class RecorderSession: ObservableObject {
             let stamp = String(format: "%.3f", Date().timeIntervalSince1970)
             self.log.append("\(stamp)  \(line)")
             if self.log.count > 200 { self.log.removeFirst() }
-        }
-    }
-
-    private func bumpScreen() {
-        DispatchQueue.main.async { [weak self] in
-            guard let self = self else { return }
-            self.screenNALCount += 1
-        }
-    }
-
-    private func bumpCamera() {
-        DispatchQueue.main.async { [weak self] in
-            guard let self = self else { return }
-            self.cameraNALCount += 1
         }
     }
 }

@@ -165,6 +165,72 @@ final class ADBClient {
     }
 
     private var syncBuffer = Data()
+    private var pullBuffer = Data()
+
+    // MARK: - sync pull（0.4.0 离线录制：拉回眼镜本地的两个 mp4）
+
+    /// 从设备拉取一个文件的完整字节。progress 回调已切到主线程，0...1。
+    func pull(path: String, timeout: TimeInterval = 120,
+              progress: ((Double) -> Void)? = nil,
+              completion: @escaping (Result<Data, Error>) -> Void) {
+        let request = ADBSyncPuller.recvFrame(path: path)
+        var finished = false
+        let finish: (Result<Data, Error>) -> Void = { [weak self] result in
+            guard let self = self else { return }
+            self.finishLock.lock()
+            if finished { self.finishLock.unlock(); return }
+            finished = true
+            self.finishLock.unlock()
+            DispatchQueue.main.async { completion(result) }
+        }
+
+        var fileData = Data()
+        var expectedSize: Int?
+        pullBuffer.removeAll(keepingCapacity: false)
+
+        open(service: "sync:", timeout: timeout,
+             onOpened: { [weak self] localId in
+                 guard let self = self else { return }
+                 self.write(localId, request)
+             },
+             onData: { [weak self] localId, chunk in
+                 guard let self = self else { return }
+                 self.pullBuffer.append(chunk)
+                 let parsed = ADBSyncPuller.parseResponses(self.pullBuffer)
+                 if parsed.consumed > 0 {
+                     self.pullBuffer.removeSubrange(0..<parsed.consumed)
+                 }
+                 for event in parsed.events {
+                     switch event {
+                     case .dent(let size):
+                         expectedSize = size > 0 ? size : nil
+                     case .data(let block):
+                         fileData.append(block)
+                     case .done:
+                         if fileData.isEmpty {
+                             finish(.failure(ADBSyncPullError.emptyFile(path)))
+                         } else {
+                             finish(.success(fileData))
+                             log?("pull 完成：\(path) \(fileData.count) 字节")
+                         }
+                         self.closeStream(localId)
+                     case .failed(let message):
+                         finish(.failure(ADBSyncPullError.rejected(message)))
+                         self.closeStream(localId)
+                     }
+                 }
+                 if let total = expectedSize, total > 0 {
+                     let ratio = min(1.0, Double(fileData.count) / Double(total))
+                     DispatchQueue.main.async { progress?(ratio) }
+                 }
+             },
+             onClose: { _, _ in
+                 finish(.failure(ADBError.connectionFailed("sync 通道提前关闭")))
+             },
+             onTimeout: {
+                 finish(.failure(ADBSyncPullError.timeout))
+             })
+    }
 
     // MARK: - 通用 stream
 

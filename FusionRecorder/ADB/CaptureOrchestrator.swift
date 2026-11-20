@@ -73,6 +73,50 @@ final class CaptureOrchestrator: ObservableObject {
         "am start -n com.fusion.capture/.KeepAliveActivity"
     }
 
+    // MARK: - 0.4.0 离线录制命令（替代原来的实时推流启动）
+
+    static let screenMP4Path = "/data/local/tmp/fusion_screen.mp4"
+    static let cameraMP4Path = "/data/local/tmp/fusion_camera.mp4"
+    static let screenStopFlag = "/data/local/tmp/fusion_stop_screen"
+
+    /// 屏幕流：shell uid 的 app_process 本地录 mp4。参数槽位：
+    /// ScreenPush <outPath> <sec> <w> <h> <fps> <bitrate> <iframe> <pts占位> <repeatUs>
+    static func screenRecordStartCommand(path: String = screenMP4Path,
+                                         width: Int = 640, height: Int = 400,
+                                         fps: Int = 20, bitrate: Int = 2_000_000,
+                                         iframe: Int = 2,
+                                         repeatUs: Int = 50_000) -> String {
+        "CLASSPATH=\(screenPushPath()) app_process / poc.ScreenPush \(path) 0 \(width) \(height) \(fps) \(bitrate) \(iframe) 0 \(repeatUs)"
+    }
+
+    /// 相机流：App uid 的前台服务本地录 mp4。
+    static func cameraRecordStartCommand(path: String = cameraMP4Path,
+                                         width: Int = 640, height: Int = 480,
+                                         fps: Int = 30, bitrate: Int = 2_000_000,
+                                         iframe: Int = 2,
+                                         repeatUs: Int = 33_333) -> String {
+        "am start-foreground-service -n com.fusion.capture/.CameraStreamService --es path \(path) --ei sec 0 --ei width \(width) --ei height \(height) --ei fps \(fps) --ei bitrate \(bitrate) --ei iframe \(iframe) --ei repeat_us \(repeatUs)"
+    }
+
+    /// 清掉上一次残留的停止标记（新录制启动时 ScreenPush 自己也会删一次）
+    static func cleanStopFlagCommand() -> String { "rm -f \(screenStopFlag)" }
+
+    /// 屏幕录制停止：touch 标记文件，主循环下一轮检测到就优雅收尾
+    static func stopScreenRecordCommand() -> String { "touch \(screenStopFlag)" }
+
+    /// 相机录制停止：带 STOP action 再 start 一次服务，
+    /// 不能 stopService —— 那会让 muxer 来不及写 moov。
+    static func stopCameraRecordCommand() -> String {
+        "am startservice -n com.fusion.capture/.CameraStreamService -a com.fusion.capture.STOP_CAMERA"
+    }
+
+    /// 等两个 mp4 写完：连续两次采样大小一致且非零。
+    static func waitFilesCommand() -> String {
+        let s = screenMP4Path
+        let c = cameraMP4Path
+        return "s1=$(stat -c %s \(s) 2>/dev/null || echo 0); c1=$(stat -c %s \(c) 2>/dev/null || echo 0); sleep 0.5; s2=$(stat -c %s \(s) 2>/dev/null || echo 0); c2=$(stat -c %s \(c) 2>/dev/null || echo 0); if [ \"$s1\" = \"$s2\" ] && [ \"$c1\" = \"$c2\" ] && [ \"$s1\" != \"0\" ] && [ \"$c1\" != \"0\" ]; then echo READY screen=$s2 camera=$c2; else echo WAITING screen=$s2/$s1 camera=$c2/$c1; fi"
+    }
+
     static func stopCameraCommand() -> String {
         "am broadcast -a com.fusion.capture.STOP_CAMERA -n com.fusion.capture/.CaptureReceiver"
     }
@@ -239,11 +283,10 @@ final class CaptureOrchestrator: ObservableObject {
                     self.finishFailure("授权相机失败：\(error.localizedDescription)", completion: completion)
                 case .success:
                     self.append("CAMERA 权限已授予")
-                    if self.deploymentOnly {
-                        self.finishSuccess("采集端已更新（未启动流）", completion: completion)
-                    } else {
-                        self.startStreams(client: client, phoneIP: phoneIP, completion: completion)
-                    }
+                    // 0.4.0：部署阶段只负责把采集端装好。启动本地录制、停止、
+                    // ADB pull 都由 RecorderSession 用自己那条连接完成，
+                    // 不再按 0.3.x 的方式启动实时推流（9114/9115）。
+                    self.finishSuccess("采集端已部署（离线录制模式）", completion: completion)
                 }
             }
         }

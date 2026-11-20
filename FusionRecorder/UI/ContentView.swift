@@ -28,9 +28,7 @@ struct ContentView: View {
     @State private var autoBusy = false
 
     @State private var showLog = false
-    @State private var showRecording = false
     @State private var showSaveDone = false
-    @State private var isFinishing = false
     @State private var showProbeNote = false
     @State private var currentComposite: UIImage?
     @State private var saveNote = ""
@@ -92,7 +90,7 @@ struct ContentView: View {
 
     private var statusText: String {
         if session.isRunning {
-            return "采集中：屏幕 NAL \(session.screenNALCount) / 相机 NAL \(session.cameraNALCount)；下方预览与录制中的合成帧使用同一套参数。"
+            return "离线录制中 \(session.recordingElapsed)s：眼镜本地录两路 mp4，停止后自动传回 iPhone 合成。下方预览仅用于调叠加参数。"
         }
         return "预览 = 成片同源：两帧真实画面经同一合成器渲染，画布 \(fusionParams.canvasWidth)×\(fusionParams.canvasHeight)。拖动下方滑杆即刻更新。"
     }
@@ -137,21 +135,9 @@ struct ContentView: View {
                         .padding(.top, 2)
 
                     HStack(spacing: 8) {
-                        smallButton(session.captureInProgress ? "抓帧中…" : "从眼镜抓两帧") {
-                            session.captureFrames(host: host,
-                                                  screenPort: UInt16(screenPort) ?? 9114,
-                                                  cameraPort: UInt16(cameraPort) ?? 9115)
-                        }
                         smallButton("恢复内置真实帧") { frames.resetToSample() }
                     }
                     .padding(.top, 6)
-
-                    if !session.captureState.isEmpty && session.captureState != "未抓帧" {
-                        Text(session.captureState)
-                            .font(.system(size: 11))
-                            .foregroundStyle(session.captureInProgress ? Palette.section : Palette.hint)
-                            .padding(.top, 4)
-                    }
 
                     HStack(spacing: 8) {
                         PhotosPicker(selection: $screenPicker, matching: .images) {
@@ -177,7 +163,7 @@ struct ContentView: View {
                             .padding(.top, 4)
                     }
 
-                    Text("抓帧：眼镜端两路推流服务要先起来（9114 屏幕 / 9115 相机）。连不上时可直接从相册导入两张真实截图，参数照样实时生效。保存的合成帧可与日后成片逐帧比对。")
+                    Text("0.4.0 离线录制：眼镜本地分别录屏幕与相机 mp4，录完传回 iPhone 合成。这里的预览只用于调叠加参数；也可从相册导入两张真实截图做参数对照。")
                         .font(.system(size: 11))
                         .foregroundStyle(Palette.hint)
                         .padding(.top, 4)
@@ -203,7 +189,7 @@ struct ContentView: View {
 
                     if showLog {
                         VStack(alignment: .leading, spacing: 2) {
-                            Text("屏幕 NAL \(session.screenNALCount) · 相机 NAL \(session.cameraNALCount) · 日志 \(session.log.count) 条")
+                            Text("阶段 \(session.offlinePhase.rawValue) · \(session.phaseDetail) · 日志 \(session.log.count) 条")
                                 .font(.system(size: 11, design: .monospaced))
                             ForEach(session.log, id: \.self) { line in
                                 Text(line)
@@ -233,7 +219,7 @@ struct ContentView: View {
                     fieldRow("相机流端口（9115）", text: $cameraPort, decimal: false)
 
                     // ---- v0.3：全自动部署（骨架）----
-                    sectionTitle("全自动部署（v0.3 骨架）")
+                    sectionTitle("全自动录制（v0.4 离线架构）")
                     Text("状态：\(orchestrator.stage.rawValue) — \(orchestrator.stageDetail)")
                         .font(.system(size: 11))
                         .foregroundStyle(orchestrator.stage == .failed ? Palette.danger : Palette.section)
@@ -246,7 +232,7 @@ struct ContentView: View {
                         }
                     }
                     .padding(.top, 6)
-                    Text("① 只装好眼镜端（自动扫 5555 → ADB 授权 → push → 启动两路）；② 部署完直接开录。眼镜 IP 留空自动扫描；iPhone IP 留空自动选（与眼镜同网段优先），选错可手动填实际局域网 IP。首次 ADB 需在眼镜上点「允许调试」。")
+                    Text("① 只装好眼镜端（扫 5555 → ADB 授权 → push APK/JAR → 授权相机）；② 部署完直接开录。眼镜本地录两路 mp4，iPhone 只计时；停止后自动传回并合成，按短的那路裁剪。眼镜 IP 留空自动扫描。首次 ADB 需在眼镜上点「允许调试」。")
                         .font(.system(size: 11))
                         .foregroundStyle(Palette.hint)
                         .padding(.top, 4)
@@ -286,27 +272,19 @@ struct ContentView: View {
                 .padding(12)
             }
 
-            if showRecording {
-                RecordingOverlay(image: session.livePreview,
-                                 frameCount: session.recordedFrameCount,
-                                 onStop: {
-                    // v0.2：stop() 异步封装成片，等写入回调再弹完成页
-                    session.stop()
-                    isFinishing = true
-                })
+            if session.offlinePhase == .recording {
+                RecordingOverlay(elapsed: session.recordingElapsed,
+                                 onStop: { session.stop() })
                 .ignoresSafeArea()
             }
 
-            if isFinishing {
-                ZStack {
-                    Palette.recordingBg.opacity(0.85).ignoresSafeArea()
-                    VStack(spacing: 12) {
-                        ProgressView()
-                        Text("正在封装成片并保存相册…")
-                            .font(.system(size: 14))
-                            .foregroundStyle(Palette.label)
-                    }
-                }
+            if session.offlinePhase == .stopping
+                || session.offlinePhase == .pulling
+                || session.offlinePhase == .composing
+                || session.offlinePhase == .saving {
+                OfflineProgressOverlay(phase: session.offlinePhase,
+                                       progress: session.offlineProgress,
+                                       detail: session.phaseDetail)
                 .ignoresSafeArea()
             }
         }
@@ -319,20 +297,11 @@ struct ContentView: View {
         .onChange(of: fusionParams) { newValue in
             session.update(params: newValue)
         }
-        // 成片写入是异步的：只有拿到结果才收起录制页、弹完成页
         .onChange(of: session.finishedMovieURL) { url in
-            if url != nil {
-                isFinishing = false
-                showRecording = false
-                showSaveDone = true
-            }
+            if url != nil { showSaveDone = true }
         }
         .onChange(of: session.recordError) { error in
-            if error != nil && isFinishing {
-                isFinishing = false
-                showRecording = false
-                showSaveDone = true
-            }
+            if error != nil { showSaveDone = true }
         }
         .sheet(isPresented: $showSaveDone) {
             SaveDoneSheet(movieURL: session.finishedMovieURL,
@@ -347,7 +316,7 @@ struct ContentView: View {
         .alert("检测屏幕采集", isPresented: $showProbeNote) {
             Button("好", role: .cancel) { }
         } message: {
-            Text("v0.2：录制已接入真实 pts 对齐与 mp4 写入。点「开始录制」后同步收 9114/9115 两路，按时间戳配对合成并写入相册。ADB RSA 授权仍需真机联调；连不上时流接收不受影响。")
+            Text("v0.4 离线录制：眼镜本地分别录屏幕与相机 mp4，不依赖 WiFi 实时推流，因此不会因链路抖动冻结。录制时只给计时；停止后自动 ADB 传回两路文件，iPhone 按绝对时间戳对齐、按短的那路裁剪并合成写相册。")
         }
     }
 
@@ -502,7 +471,8 @@ struct ContentView: View {
                 self.autoBusy = false
                 switch result {
                 case .success:
-                    self.showRecording = true
+                    // 录制页由 session.offlinePhase 驱动，markRecordingStarted 已切换
+                    break
                 case .failure(let error):
                     self.session.appendUser("全自动启动失败：\(error.localizedDescription)")
                 }
@@ -513,11 +483,9 @@ struct ContentView: View {
     private func toggleRecording() {
         if session.isRunning {
             session.stop()
-            isFinishing = true
         } else {
-            // 主「开始录制」按钮统一走全自动流程（部署采集端 + 开监听 + 收流写片）。
-            // 旧的手动方向（iPhone 主动连眼镜 server）与现在的采集端 client 模式不匹配，
-            // 会连不上→0 帧→卡在封装界面。全自动是唯一可用路径，按钮语义与②对齐。
+            // 主「开始录制」按钮与「② 全自动录制」走同一条离线链路：
+            // 部署采集端 → 眼镜本地录两路 mp4 → 计时 → 停止 → ADB pull → 离线合成。
             autoRecord()
         }
     }
