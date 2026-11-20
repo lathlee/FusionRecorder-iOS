@@ -26,8 +26,9 @@ settings:
     # 0.3.6 = 修 4 项真机问题：手动按钮卡封装 / 相机倒置180° / 成片时长缩水 / 0帧卡死
     # 0.3.7 = 重构成败关键：合成与写帧解耦(异步合成+恒定20fps写帧)，默认分辨率降640×480
     # 0.3.8 = 修 0.3.7 画面冻结：合成改独立20fps定时器+取两路最新帧；加2秒诊断日志
-    MARKETING_VERSION: "0.3.8"
-    CURRENT_PROJECT_VERSION: "9"
+    # 0.3.9 = 修眼镜端相机流中途断线不自恢复（停推30+s）：sender自动重连补发SPS/PPS + wake lock
+    MARKETING_VERSION: "0.3.9"
+    CURRENT_PROJECT_VERSION: "10"
     # 侧载不需要 Apple 签名，签名交给 SideStore / AltStore 用免费 Apple ID 做
     CODE_SIGNING_ALLOWED: "NO"
     CODE_SIGNING_REQUIRED: "NO"

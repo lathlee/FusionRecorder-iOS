@@ -55,8 +55,12 @@ final class H264FrameDecoder {
             }
             return nil
         case 7:                       // SPS
+            // 0.3.9：眼镜端 TCP 重连后会补发 SPS/PPS。参数集若变化必须重建会话，
+            // 否则 VTDecompressionSession 仍用旧格式，新流会一直解不出画面。
+            if let old = sps, old != nal { resetSessionForNewParams() }
             sps = nal
         case 8:                       // PPS
+            if let old = pps, old != nal { resetSessionForNewParams() }
             pps = nal
         case 5, 1:                    // IDR / non-IDR slice
             if session == nil { configure() }
@@ -76,6 +80,17 @@ final class H264FrameDecoder {
         lock.lock()
         defer { lock.unlock() }
         return latest
+    }
+
+    /// 参数集变化时丢弃旧解码会话，保留 latest 让画面先停在上一次，
+    /// 等新参数集 + 下一帧 IDR 到来后 configure() 会重建会话。
+    private func resetSessionForNewParams() {
+        if let session = session {
+            VTDecompressionSessionWaitForAsynchronousFrames(session)
+            VTDecompressionSessionInvalidate(session)
+            self.session = nil
+        }
+        formatDescription = nil
     }
 
     func invalidate() {
