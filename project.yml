@@ -21,7 +21,7 @@ settings:
     # 0.1.2 = 预览换成真实帧合成，且预览/录制共用唯一合成器与参数（WYSIWYG）
     # 0.2.0 = 双路 SEI pts 对齐 + AVAssetWriter 逐帧写 mp4 到相册
     # 0.3.0 = ADB 自动化骨架（发现/授权/sync push/命令状态机）+ 全自动监听接收
-    MARKETING_VERSION: "0.3.0"
+    MARKETING_VERSION: "0.3.4"
     CURRENT_PROJECT_VERSION: "5"
     # 侧载不需要 Apple 签名，签名交给 SideStore / AltStore 用免费 Apple ID 做
     CODE_SIGNING_ALLOWED: "NO"
