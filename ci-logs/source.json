@@ -1,0 +1,26 @@
+{
+  "name": "FusionRecorder",
+  "identifier": "com.lath.fusionrecorder.sidestore.raw",
+  "sourceURL": "https://raw.githubusercontent.com/lathlee/FusionRecorder-iOS/ios-build/ci-logs/source.json",
+  "apps": [
+    {
+      "name": "融合录屏",
+      "bundleIdentifier": "com.lath.fusionrecorder",
+      "version": "0.4.4",
+      "versionDate": "2026-11-20",
+      "downloadURL": "https://raw.githubusercontent.com/lathlee/FusionRecorder-iOS/ios-build/ci-logs/FusionRecorder-0.4.4-unsigned.ipa",
+      "localizedDescription": "融合录屏 iPhone 端：无线 ADB 启动采集，双路 H264 裸 TCP 接收，VideoToolbox + Metal 实时合成，成片写入相册。",
+      "iconURL": "https://raw.githubusercontent.com/lathlee/FusionRecorder-iOS/ios-build/ci-logs/icon.png",
+      "tintColor": "0A84FF",
+      "size": 426706,
+      "permissions": []
+    }
+  ],
+  "news": [
+    {
+      "title": "FusionRecorder 0.4.4",
+      "date": "2026-11-20",
+      "caption": "独立仓库云端编译产物，添加源后可用 SideStore 侧载安装。"
+    }
+  ]
+}
