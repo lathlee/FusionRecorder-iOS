@@ -180,11 +180,13 @@ final class OfflineCompositor {
         }
         // 共享区间起点：两路都已经有画面的时刻
         let startPTS = max(s0, c0)
-        // 终点估算：任一路「首帧 + 时长」的较小者，仅用于进度条
+        // 终点估算：任一路「首帧 + 时长」的较小者。只用于进度条和兜底终止；
+        // 若 AVAsset 没给出有效时长，绝不能拿 0 当终点（否则第一帧后就 break）。
         let sEnd = s0 + screen.durationUs
         let cEnd = c0 + camera.durationUs
-        let endPTS = min(sEnd, cEnd)
-        let totalUs = max(1, endPTS - startPTS)
+        let estimatedEnd = min(sEnd, cEnd)
+        let hasEstimate = estimatedEnd > startPTS
+        let totalUs = hasEstimate ? estimatedEnd - startPTS : 1
 
         let size = params.renderSize
         let writer = MovieWriter(width: size.width, height: size.height)
@@ -201,12 +203,15 @@ final class OfflineCompositor {
         }
 
         while true {
-            let sf = screen.frame(atOrBefore: target)
-            let cf = camera.frame(atOrBefore: target)
-            guard let s = sf, let c = cf else { break }
-
-            guard let composed = FusionCompositor.render(
-                    screen: s.image, camera: c.image, params: params) else {
+            // CIContext.createCGImage 产出的是 autoreleased CGImage。合成几十秒的
+            // 视频会有上千帧，不在每帧 drain autorelease pool 的话内存会线性涨到 GB 级。
+            let composed: CGImage? = autoreleasepool {
+                guard let s = screen.frame(atOrBefore: target),
+                      let c = camera.frame(atOrBefore: target) else { return nil }
+                return FusionCompositor.render(screen: s.image, camera: c.image, params: params)
+            }
+            guard let composed = composed else {
+                if screen.exhausted || camera.exhausted { break }
                 continue
             }
             try writer.append(frame: composed, presentationTimeUs: target - startPTS)
@@ -214,13 +219,14 @@ final class OfflineCompositor {
 
             if written - lastReport >= 20 {          // 每秒报一次进度
                 lastReport = written
-                let ratio = min(1.0, Double(target - startPTS) / Double(totalUs))
+                let ratio = hasEstimate
+                    ? min(1.0, Double(target - startPTS) / Double(totalUs)) : 0
                 progress?(ratio)
             }
 
             // 按短的那路裁剪：任一路读完即停，但已经写入的这一帧保留
             if screen.exhausted || camera.exhausted { break }
-            if target - startPTS >= totalUs { break }
+            if hasEstimate && target - startPTS >= totalUs { break }
             if written > 20 * 3600 * 4 { break }     // 4 小时硬上限，防死循环
             target += stepUs
         }
