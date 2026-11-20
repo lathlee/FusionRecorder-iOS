@@ -53,9 +53,13 @@ enum FusionCompositor {
         // ---- 相机层：铺满画布 -------------------------------------------------
         guard var cam = rasterize(camera, width: W, height: H,
                                   rotation: params.rotation, aspectFill: true) else { return nil }
-        applyCameraAdjustment(&cam, width: W, height: H,
-                              contrast: Float(params.contrast),
-                              brightness: Float(params.cameraBrightness))
+        // contrast=1 且 brightness=0 时是恒等变换，整幅画布逐像素浮点循环纯属浪费
+        // （真机实测这是卡顿主因之一）。默认参数直接跳过。
+        if abs(Float(params.contrast) - 1.0) > 0.001 || abs(Float(params.cameraBrightness)) > 0.001 {
+            applyCameraAdjustment(&cam, width: W, height: H,
+                                  contrast: Float(params.contrast),
+                                  brightness: Float(params.cameraBrightness))
+        }
 
         // ---- 屏幕层：rasterize 原图，采样时按 uTexMatrix 取左侧 (1-crop) ------
         let sw = screen.width, sh = screen.height

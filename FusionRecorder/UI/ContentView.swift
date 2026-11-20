@@ -45,7 +45,9 @@ struct ContentView: View {
 
     // 采集参数（默认值取自 MainActivity.loadPrefsIntoUi）
     @AppStorage("cameraIndex") private var cameraIndex = 0
-    @AppStorage("resolutionIndex") private var resolutionIndex = 1
+    // 默认 640×480：相机流源就是 640×480，选 1280/1920 只是把同样的像素放大，
+    // 却让逐像素合成算力翻 4~9 倍——真机实测会拖垮写帧导致卡顿。需要高清再手动调高。
+    @AppStorage("resolutionIndex") private var resolutionIndex = 0
     @AppStorage("fpsIndex") private var fpsIndex = 2
     @AppStorage("bitrateIndex") private var bitrateIndex = 2
     @AppStorage("rotateIndex") private var rotateIndex = 0

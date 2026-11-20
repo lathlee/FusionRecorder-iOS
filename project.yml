@@ -24,8 +24,9 @@ settings:
     # 0.3.4 = 修 AUTH 公钥 NUL / sync push remoteId / iPhone IP 选网卡 / SideStore 版本
     # 0.3.5 = 内嵌采集端支持连接重试，修首连 ECONNREFUSED 导致相机流 0 帧
     # 0.3.6 = 修 4 项真机问题：手动按钮卡封装 / 相机倒置180° / 成片时长缩水 / 0帧卡死
-    MARKETING_VERSION: "0.3.6"
-    CURRENT_PROJECT_VERSION: "7"
+    # 0.3.7 = 重构成败关键：合成与写帧解耦(异步合成+恒定20fps写帧)，默认分辨率降640×480
+    MARKETING_VERSION: "0.3.7"
+    CURRENT_PROJECT_VERSION: "8"
     # 侧载不需要 Apple 签名，签名交给 SideStore / AltStore 用免费 Apple ID 做
     CODE_SIGNING_ALLOWED: "NO"
     CODE_SIGNING_REQUIRED: "NO"

@@ -117,6 +117,18 @@ final class RecorderSession: ObservableObject {
     private var outputFrameIndex: Int64 = 0
     private let outputFPS: Int64 = 20
 
+    // ★ 合成与写帧解耦（0.3.7 关键重构）：
+    // 之前 CFR 定时器里同步做 FusionCompositor.render（1280×720 逐像素 Swift 循环，
+    // 单帧可达 200ms+），把 50ms 的写帧节奏彻底拖垮 → 实际每秒只写几帧 → 卡顿、
+    // 成片时长缩水。现在改成：
+    //   · 合成线程：帧一到就异步合成，结果存 latestComposed（始终最新的那一帧）
+    //   · 写帧定时器：每 50ms 只做「取最新合成帧 → append」，绝不阻塞在合成上
+    // 这样写帧恒定 20fps、时长正确；合成再慢也只是"画面更新慢"，不会卡死整条管线。
+    private let composeQueue = DispatchQueue(label: "com.lath.fusionrecorder.compose")
+    private let composedLock = NSLock()
+    private var latestComposed: CGImage?
+    private var composePending = false
+
     /// 单调墙钟微秒（DispatchTime，不受系统时间调整影响）
     private static func nowWallUs() -> Int64 {
         Int64(DispatchTime.now().uptimeNanoseconds / 1_000)
@@ -208,6 +220,12 @@ final class RecorderSession: ObservableObject {
         wallClockBaseUs = nil
         outputFrameIndex = 0
         frameLock.unlock()
+        composedLock.lock()
+        latestComposed = nil
+        composePending = false
+        composedLock.unlock()
+        liveScreen = nil
+        liveCamera = nil
 
         let onScreenNAL: (Data) -> Void = { [weak self] nal in
             self?.bumpScreen()
@@ -302,7 +320,8 @@ final class RecorderSession: ObservableObject {
     }
 
     /// 每来一个 NAL：解出帧 → 带 pts 入对应队列。
-    /// 合成不再在这里做，改由 CFR 定时器按统一时间轴驱动（避免帧率不同导致错配）。
+    /// ★ 这里绝不做合成（0.3.7）：合成统一放到 composeQueue 异步执行，
+    /// 且同时供实时预览与写帧使用，避免"每条流每帧各合成一次"把主线程/队列拖死。
     private func handleLive(_ nal: Data, isScreen: Bool) {
         let decoder = isScreen ? screenDecoder : cameraDecoder
         guard let result = decoder.feedWithPTS(nal) else { return }
@@ -310,32 +329,64 @@ final class RecorderSession: ObservableObject {
         frameLock.lock()
         if isScreen {
             screenQueue.append(pts: result.ptsUs, image: result.image)
+            liveScreen = result.image
         } else {
             cameraQueue.append(pts: result.ptsUs, image: result.image)
+            liveCamera = result.image
         }
         // t0 = 两路都有帧后，取两路首帧中较早者（PROTOCOL.md §6）
         if timelineOriginUs == nil {
             if let s = screenQueue.firstPTS, let c = cameraQueue.firstPTS {
                 timelineOriginUs = min(s, c)
-                // 同时记下真实墙钟：成片时间轴按真实经过时间推进，
-                // 写帧慢/掉帧时后续帧仍拿到正确的 pts，不会把时长压缩。
                 wallClockBaseUs = Self.nowWallUs()
                 append("两路首帧 pts 差 \(abs(s - c)) μs，时间零点已建立")
             }
         }
-        let s = liveScreen
-        let c = liveCamera
         frameLock.unlock()
 
-        // 录制页的实时预览：仍显示两路最新帧的合成结果（与写入帧同源）
-        if isScreen {
-            frameLock.lock(); liveScreen = result.image; frameLock.unlock()
-        } else {
-            frameLock.lock(); liveCamera = result.image; frameLock.unlock()
+        scheduleCompose()
+    }
+
+    /// 触发一次异步合成（带去重：上一轮还没做完就不重复入队）。
+    private func scheduleCompose() {
+        composedLock.lock()
+        if composePending { composedLock.unlock(); return }
+        composePending = true
+        composedLock.unlock()
+        composeQueue.async { [weak self] in
+            self?.composeOnce()
+            guard let self = self else { return }
+            self.composedLock.lock()
+            self.composePending = false
+            self.composedLock.unlock()
         }
-        if let s = s, let c = c, let composed = recordingCompositor.compose(screen: s, camera: c) {
-            DispatchQueue.main.async { [weak self] in self?.livePreview = composed }
-        }
+    }
+
+    /// 在合成队列中做一次合成：取两路相对当前时刻锚定的帧 → 合成 →
+    /// 结果同时更新 latestComposed（写帧用）与 livePreview（UI 用）。
+    private func composeOnce() {
+        guard isRunning else { return }
+        frameLock.lock()
+        let t0 = timelineOriginUs
+        let base = wallClockBaseUs
+        let sEmpty = screenQueue.isEmpty
+        let cEmpty = cameraQueue.isEmpty
+        frameLock.unlock()
+        guard let t0 = t0, let base = base, !sEmpty, !cEmpty else { return }
+        // 取两路"不晚于当前时刻"的最新帧即可：写帧线程按自己节奏 append，
+        // 合成线程只负责不断产出最新画面。不做帧序号对齐，避免跨线程竞争。
+        let targetUs = t0 + max(0, Self.nowWallUs() - base)
+        frameLock.lock()
+        let s = screenQueue.anchor(before: targetUs)
+        let c = cameraQueue.anchor(before: targetUs)
+        frameLock.unlock()
+        guard let s = s, let c = c else { return }
+        guard let composed = recordingCompositor.compose(screen: s.image, camera: c.image) else { return }
+
+        composedLock.lock()
+        latestComposed = composed
+        composedLock.unlock()
+        DispatchQueue.main.async { [weak self] in self?.livePreview = composed }
     }
 
     // MARK: - CFR 定时输出（20fps）
@@ -363,21 +414,23 @@ final class RecorderSession: ObservableObject {
         frameLock.unlock()
         guard let t0 = origin, let base = baseUs, !sEmpty, !cEmpty else { return }
 
-        // ★ pts 跟随真实墙钟：targetUs = 时间零点 + 真实经过时间。
-        // 不再用 outputFrameIndex×50ms——那样合成一慢（1280×720 逐像素 Swift 很重），
-        // 写帧数就落后，成片时长被压成"帧数/20fps"，丢掉后半段。
-        // 用真实时间后，即使掉帧，后续帧也拿到正确 pts，成片时长 = 实际录制时长。
-        let elapsedUs = max(0, Self.nowWallUs() - base)
-        let targetUs = t0 + elapsedUs
-        frameLock.lock()
-        let s = screenQueue.anchor(before: targetUs)
-        let c = cameraQueue.anchor(before: targetUs)
-        frameLock.unlock()
-        guard let s = s, let c = c else { return }
+        // ★ 写帧只做两件事：取最新合成帧 + append。绝不在这里合成（0.3.7）。
+        // pts 用「帧序号 × 50ms」——写帧节奏已稳定在 20fps，序号即真实时间，
+        // 成片时长 = 帧数/20 ≈ 实际录制时长；且 pts 均匀，播放器不会卡顿。
+        // 墙钟只用来监控"合成是否落后太多"，落后则触发一次异步补合成。
+        composedLock.lock()
+        let composed = latestComposed
+        composedLock.unlock()
 
-        guard let composed = recordingCompositor.compose(screen: s.image, camera: c.image) else { return }
+        let targetUs = t0 + outputFrameIndex * 1_000_000 / outputFPS
+        let elapsedUs = max(0, Self.nowWallUs() - base)
+        // 合成落后超过 300ms：催一次（合成仍异步，不阻塞本次写帧）
+        if elapsedUs > (outputFrameIndex * 1_000_000 / outputFPS) + 300_000 {
+            scheduleCompose()
+        }
+        guard let composed = composed else { return }   // 首帧还没合成出来，本 tick 跳过
+
         do {
-            // 用真实 CFR 时刻作 pts：掉帧时后面的帧仍按真实时间写，时长不缩水
             try writer.append(frame: composed, presentationTimeUs: targetUs)
             outputFrameIndex += 1
             if outputFrameIndex % 20 == 0 {
