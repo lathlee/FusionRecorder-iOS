@@ -90,10 +90,17 @@ class FakeAdbd(threading.Thread):
                         conn.sendall(packet(AUTH, AUTH_TOKEN, 0, b"u" * 20))
                     elif cmd == AUTH and arg0 == AUTH_PUBLICKEY:
                         auth_round += 1
+                        # 真 adbd 把 payload 当 C 字符串，要求 NUL 结尾。
+                        # 缺 NUL 时真机报 "Key must be a null-terminated string" 并挂断，
+                        # 这里如实模拟：不以 \0 结尾就关闭连接，绝不放行。
                         text = payload.decode(errors="replace")
-                        self.transcript.append("AUTH_PUBLICKEY(%s)" %
-                                               ("ok" if text.endswith("fusion@iphone") else "BAD"))
-                        conn.sendall(packet(CNXN, 0x01000000, 0x00100000, b"device::\0"))
+                        ok = payload.endswith(b"\x00") and "fusion@iphone" in text
+                        self.transcript.append("AUTH_PUBLICKEY(%s)" % ("ok" if ok else "BAD"))
+                        if ok:
+                            conn.sendall(packet(CNXN, 0x01000000, 0x00100000, b"device::\0"))
+                        else:
+                            conn.close()
+                            return
                     elif cmd == OPEN:
                         service = payload.rstrip(b"\0").decode(errors="replace")
                         self.transcript.append("OPEN:" + service)
@@ -186,8 +193,8 @@ def test_auth_and_shell(port, transcript):
     cmd, a0, a1, payload = c.recv_one()
     assert (cmd, a0) == (AUTH, AUTH_TOKEN), "签名未被接受应再来 TOKEN"
 
-    # 第 2 轮：公钥，base64 + ' fusion@iphone'
-    c.send(AUTH, AUTH_PUBLICKEY, 0, b"QUJD" + b" fusion@iphone")
+    # 第 2 轮：公钥，base64 + ' fusion@iphone' + NUL（真 adbd 要求 null-terminated）
+    c.send(AUTH, AUTH_PUBLICKEY, 0, b"QUJD" + b" fusion@iphone\x00")
     cmd, a0, a1, payload = c.recv_one()
     assert cmd == CNXN, "公钥接受后应收到 CNXN"
 
@@ -216,7 +223,7 @@ def test_sync_push(port, transcript):
     c.recv_one()                                   # AUTH TOKEN
     c.send(AUTH, AUTH_SIGNATURE, 0, b"S" * 256)
     c.recv_one()                                   # TOKEN again
-    c.send(AUTH, AUTH_PUBLICKEY, 0, b"QUJD fusion@iphone")
+    c.send(AUTH, AUTH_PUBLICKEY, 0, b"QUJD fusion@iphone\x00")
     c.recv_one()                                   # CNXN
 
     c.send(OPEN, 0x20000001, 0, b"sync:\0")
@@ -238,6 +245,29 @@ def test_sync_push(port, transcript):
     assert matched, "假 adbd 没收到 sync 帧"
     assert "SEND:/data/local/tmp/screen-push.jar,0644" in matched[-1]
     assert "DATA:5" in matched[-1] and "DONE:4" in matched[-1]
+    return True
+
+
+def test_pubkey_requires_nul(port, transcript):
+    """回归测试：公钥 payload 缺结尾 NUL 时，真 adbd 会拒绝（挂断）。
+    mock adbd 必须同样拒绝，否则这类 bug 会漏到真机（2026-11-20 uws6152 实测）。"""
+    c = Client(port)
+    c.send(CNXN, 0x01000000, 0x00100000, b"host::\0")
+    c.recv_one()                                   # AUTH TOKEN
+    c.send(AUTH, AUTH_SIGNATURE, 0, b"S" * 256)
+    c.recv_one()                                   # TOKEN again
+    c.send(AUTH, AUTH_PUBLICKEY, 0, b"QUJD fusion@iphone")   # 故意缺 \0
+    # mock adbd 应挂断：设短超时后读原始 socket，拿到 b"" 即被关闭
+    c.sock.settimeout(2)
+    rejected = False
+    try:
+        data = c.sock.recv(65536)
+        rejected = (data == b"")   # 对端关闭 = 拒绝
+    except (ConnectionError, OSError, EOFError, TimeoutError):
+        rejected = True
+    c.close()
+    assert rejected, "缺 NUL 的公钥应被拒绝（模拟真 adbd 的 null-terminated 校验）"
+    assert "AUTH_PUBLICKEY(BAD)" in transcript, "mock adbd 应标记 BAD"
     return True
 
 
@@ -270,6 +300,7 @@ def main():
     results = []
     for name, fn in [
         ("AUTH 两轮 + shell 多片输出", test_auth_and_shell),
+        ("公钥缺 NUL 必被拒(回归)", test_pubkey_requires_nul),
         ("sync push 字节序列", test_sync_push),
         ("命令构造与 Swift 交叉核对", lambda p, t: test_commands()),
     ]:

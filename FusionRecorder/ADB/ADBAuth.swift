@@ -83,8 +83,13 @@ final class ADBAuth {
 
     // MARK: - AUTH_PUBLICKEY
 
-    /// payload = base64(SPKI DER) + " fusion@iphone"。
+    /// payload = base64(SPKI DER) + " fusion@iphone" + NUL。
     /// 设备端把它当作 adb_keys 的一行：base64 部分是指纹，后面是注释。
+    ///
+    /// ★ 结尾必须带 NUL(\0)：AOSP adbd 的 register_host_key 把 payload 当 C 字符串，
+    ///   要求 null-terminated。缺 NUL 时真机报 "Key must be a null-terminated string"，
+    ///   握手卡死且不弹授权框（uws6152/ARGlasses 2026-11-20 真机实测确认）。
+    ///   标准 adb 客户端发的就是 `strlen(key)+1`（含结尾 \0）。2026-11-20 修复。
     func publicKeyPayload() -> Data? {
         guard let key = privateKey, let pubKey = SecKeyCopyPublicKey(key) else { return nil }
         var error: Unmanaged<CFError>?
@@ -93,7 +98,9 @@ final class ADBAuth {
             return nil
         }
         let blob = der.base64EncodedString() + " fusion@iphone"
-        return Data(blob.utf8)
+        var payload = Data(blob.utf8)
+        payload.append(0)   // NUL terminator —— adbd 必需，缺了会握手卡死
+        return payload
     }
 
     /// 指纹用于 UI 显示，方便用户核对设备 adb_keys 里多出来的那一行。
