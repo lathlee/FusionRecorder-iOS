@@ -293,11 +293,14 @@ final class CaptureOrchestrator: ObservableObject {
         }
     }
 
-    /// 校验 push 是否真的落地（字节数一致才算 OK）
+    /// 校验 push 是否真的落地（字节数一致才算 OK）。
+    /// 顺带 `chmod 644`：即使 sync SEND 的 mode 字段再出问题，也不会留下
+    /// 「只写不可读」的文件把 `pm install` 卡死。
     static func verifyAssetsCommand(jarBytes: Int, apkBytes: Int) -> String {
         let j = screenPushPath()
         let a = apkPushPath()
-        return "j=$(stat -c %s \(j) 2>/dev/null || echo 0); "
+        return "chmod 644 \(j) \(a) 2>/dev/null; "
+            + "j=$(stat -c %s \(j) 2>/dev/null || echo 0); "
             + "a=$(stat -c %s \(a) 2>/dev/null || echo 0); "
             + "if [ \"$j\" = \"\(jarBytes)\" ] && [ \"$a\" = \"\(apkBytes)\" ]; "
             + "then echo OK jar=$j apk=$a; "

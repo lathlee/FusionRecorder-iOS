@@ -77,6 +77,9 @@ final class RecorderSession: ObservableObject {
 
     private var pullScreenProgress: Double = 0
     private var pullCameraProgress: Double = 0
+    /// 远端两个 mp4 的字节数（来自 stat），用于拉取进度条
+    private var pullScreenTotal: Int?
+    private var pullCameraTotal: Int?
 
     /// 抓帧用的旧解码器（参数预览/调试用；离线录制路径不调用）
     private var captureScreenReceiver: H264StreamReceiver?
@@ -281,9 +284,19 @@ final class RecorderSession: ObservableObject {
                     self.fail("眼镜端 mp4 未写完或为空：\(text)")
                     return
                 }
+                // "READY screen=10969 camera=1924360" → 拿这两个数当拉取进度分母
+                self.pullScreenTotal = Self.number(after: "screen=", in: text)
+                self.pullCameraTotal = Self.number(after: "camera=", in: text)
                 self.pullFiles(adb: adb)
             }
         }
+    }
+
+    /// 从 "screen=12345 camera=678" 里取数字
+    private static func number(after key: String, in text: String) -> Int? {
+        guard let range = text.range(of: key) else { return nil }
+        let digits = text[range.upperBound...].prefix { $0.isNumber }
+        return digits.isEmpty ? nil : Int(digits)
     }
 
     private func pullFiles(adb: ADBClient) {
@@ -295,7 +308,8 @@ final class RecorderSession: ObservableObject {
         }
         setPhase(.pulling, "传输屏幕 mp4（0%）…")
 
-        adb.pull(path: screenRemotePath, progress: { [weak self] ratio in
+        adb.pull(path: screenRemotePath, knownSize: pullScreenTotal,
+                 progress: { [weak self] ratio in
             guard let self = self else { return }
             self.pullScreenProgress = ratio
             self.updatePullProgress()
@@ -312,7 +326,8 @@ final class RecorderSession: ObservableObject {
             }
 
             DispatchQueue.main.async { self.phaseDetail = "传输相机 mp4（0%）…" }
-            adb.pull(path: cameraRemotePath, progress: { [weak self] ratio in
+            adb.pull(path: cameraRemotePath, knownSize: pullCameraTotal,
+                     progress: { [weak self] ratio in
                 guard let self = self else { return }
                 self.pullCameraProgress = ratio
                 self.updatePullProgress()

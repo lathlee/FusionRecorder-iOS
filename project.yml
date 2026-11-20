@@ -35,8 +35,10 @@ settings:
     #         录制前把屏幕叫醒并保持常亮（屏幕路没帧就录不出东西）
     # 0.4.3 = 「点开始录制没反应」：复用部署那条已授权连接（第二条连接会卡在 AUTH/CNXN 之后）/
     #         push 后校验远端字节数 / pm install 失败判定补 Exception / 所有静默 return 都打日志
-    MARKETING_VERSION: "0.4.3"
-    CURRENT_PROJECT_VERSION: "14"
+    # 0.4.4 = 根治「部署成功但没装上」：sync SEND 的 mode 必须是十进制 st_mode（33188），
+    #         写八进制 "644" 会被 adbd 当成十进制 → 0o1204（--w----r-T）→ pm install 读不了
+    MARKETING_VERSION: "0.4.4"
+    CURRENT_PROJECT_VERSION: "15"
     # 侧载不需要 Apple 签名，签名交给 SideStore / AltStore 用免费 Apple ID 做
     CODE_SIGNING_ALLOWED: "NO"
     CODE_SIGNING_REQUIRED: "NO"

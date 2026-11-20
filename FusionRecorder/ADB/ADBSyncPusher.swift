@@ -6,7 +6,8 @@
 //
 //  字节规格来自 AOSP packages/modules/adb/SYNC.TXT：
 //   · 所有 sync 包 = 4 字节 ASCII ID + 4 字节小端 uint32 长度 + 长度个字节
-//   · SEND 的 payload 是 "<远端路径>,<八进制权限>"，如 /data/local/tmp/screen-push.jar,0644
+//   · SEND 的 payload 是 "<远端路径>,<st_mode 十进制>"，如 /data/local/tmp/screen-push.jar,33188
+//     （33188 = 0o100644；adbd 按十进制解析，写八进制 "644" 会得到不可读的文件）
 //   · DATA 每块 ≤ 64 KiB，长度即块字节数
 //   · DONE 的长度是文件 mtime（秒），设备只对 DONE 回 OKAY/FAIL
 //
@@ -33,13 +34,16 @@ struct ADBSyncPusher {
     /// 单个文件分块适配 sync DATA（≤64 KiB）。返回将要写进 sync 流的完整字节。
     /// - parameters:
     ///   - path: 远端绝对路径
-    ///   - mode: 权限，如 0644
+    ///   - mode: **完整的 st_mode，十进制**（含 S_IFREG）。adbd 用 `strtoul(..., 10)`
+    ///     解析这个字段，所以必须传 33188（= 0o100644），不能传八进制串 "644"。
+    ///     真机 16:31 事故：传 "644" 被当成十进制 644 → chmod 成 0o1204（`--w----r-T`），
+    ///     文件只写不可读，`pm install` 直接报 `Error: Can't open file`。
     ///   - data: 文件内容
     ///   - mtime: 远端文件时间戳（秒）
-    static func sendFrames(path: String, mode: UInt32 = 0o644,
+    static func sendFrames(path: String, mode: UInt32 = 0o100644,
                            data: Data, mtime: UInt32) -> [Data] {
         var frames: [Data] = []
-        let pathMode = "\(path),\(String(mode, radix: 8))"
+        let pathMode = "\(path),\(mode)"
         frames.append(syncFrame("SEND", payload: Data(pathMode.utf8)))
 
         let chunkSize = 60 * 1024          // 留余量，严格小于 64 KiB

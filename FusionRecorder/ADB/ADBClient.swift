@@ -121,8 +121,9 @@ final class ADBClient {
 
     // MARK: - sync push
 
-    /// 把本地文件字节推到设备。path 用绝对路径，mode 如 0644。
-    func push(path: String, data: Data, mode: UInt32 = 0o644,
+    /// 把本地文件字节推到设备。path 用绝对路径。
+    /// mode 必须是**完整 st_mode 的十进制值**（0o100644 = 33188），原因见 ADBSyncPusher。
+    func push(path: String, data: Data, mode: UInt32 = 0o100644,
               timeout: TimeInterval = 30,
               completion: @escaping (Result<Void, Error>) -> Void) {
         let frames = ADBSyncPusher.sendFrames(
@@ -177,7 +178,7 @@ final class ADBClient {
     /// 拉取远端文件。timeout 是「空闲超时」：每收到一块数据就重新计时，
     /// 所以真正限制的是「链路卡死多久算失败」，而不是总时长。
     /// 眼镜实测无线 ADB 只有 0.2~0.5MB/s，1 分钟录制约 12MB，硬性总超时会误杀。
-    func pull(path: String, timeout: TimeInterval = 45,
+    func pull(path: String, knownSize: Int? = nil, timeout: TimeInterval = 45,
               progress: ((Double) -> Void)? = nil,
               completion: @escaping (Result<Data, Error>) -> Void) {
         let request = ADBSyncPuller.recvFrame(path: path)
@@ -192,7 +193,9 @@ final class ADBClient {
         }
 
         var fileData = Data()
-        var expectedSize: Int?
+        // 这台设备的 adbd 对 RECV 不回 DENT（实测：只有 DATA 块 + OKAY），
+        // 所以进度条必须靠调用方先 stat 出的文件大小来算，否则永远 0%。
+        var expectedSize: Int? = knownSize
         pullBuffer.removeAll(keepingCapacity: false)
 
         open(service: "sync:", timeout: timeout,
@@ -211,7 +214,8 @@ final class ADBClient {
                  for event in parsed.events {
                      switch event {
                      case .dent(let size):
-                         expectedSize = size > 0 ? size : nil
+                         // 只有真给了有效 size 才覆盖调用方传进来的 stat 结果
+                         if size > 0 { expectedSize = size }
                      case .data(let block):
                          fileData.append(block)
                      case .done:
