@@ -97,13 +97,24 @@ final class CaptureOrchestrator: ObservableObject {
         }
         isBusy = true
         resetLog()
-        let phoneIP = iphoneHostIP ?? GlassesDiscovery.shared.localIPv4().first
-        iphoneIP = phoneIP
+
+        // phoneIP 必须在眼镜 IP 确定之后再算：用它选「与眼镜同网段」的本机地址。
+        // 之前在函数开头就 localIPv4().first，取到过 16.2.0.0 虚拟接口 → 眼镜连不上。
+        func deploy(to glassesAddress: String) {
+            let phone = iphoneHostIP ?? GlassesDiscovery.shared.bestLocalIP(for: glassesAddress)
+            guard let phoneIP = phone else {
+                self.finishFailure("无法确定 iPhone 局域网 IP：确认已连上 WiFi/热点", completion: completion)
+                return
+            }
+            self.iphoneIP = phoneIP
+            self.append("本机 IP：\(phoneIP)（下发采集端的 host，眼镜会连它）")
+            self.connectAndDeploy(glassesIP: glassesAddress, iphoneIP: phoneIP, completion: completion)
+        }
 
         if let given = host, !given.isEmpty {
             glassesIP = given
             append("使用指定眼镜 IP：\(given)")
-            connectAndDeploy(glassesIP: given, iphoneIP: phoneIP, completion: completion)
+            deploy(to: given)
         } else {
             setStage(.discovering, "扫描 5555 端口（上次 IP 优先）…")
             GlassesDiscovery.shared.scan { [weak self] result in
@@ -114,7 +125,7 @@ final class CaptureOrchestrator: ObservableObject {
                 }
                 self.glassesIP = found.ip
                 self.append("发现眼镜 \(found.ip)（\(found.source)）")
-                self.connectAndDeploy(glassesIP: found.ip, iphoneIP: phoneIP, completion: completion)
+                deploy(to: found.ip)
             }
         }
     }

@@ -326,6 +326,47 @@ def test_commands():
     return True
 
 
+def test_local_ip_pick():
+    """本机 IP 选择：不能盲取 first，必须同网段优先、过滤虚拟接口。
+    2026-11-20 真机取到 16.2.0.0（虚拟接口）导致眼镜连不上。"""
+    # Swift 源码必须含新方法（防回归：确认改动真的进了源码）
+    disc = open("FusionRecorder/ADB/GlassesDiscovery.swift", encoding="utf-8").read()
+    orch = open("FusionRecorder/ADB/CaptureOrchestrator.swift", encoding="utf-8").read()
+    assert "pickLocalIP" in disc and "bestLocalIP" in disc, "缺少 IP 选择方法"
+    assert "bestLocalIP(for:" in orch, "orchestrator 未用智能选 IP"
+    # 排除注释行后，实际代码不应再有 localIPv4().first
+    code_lines = [l for l in orch.splitlines() if not l.strip().startswith("//")]
+    assert not any("localIPv4().first" in l for l in code_lines), "orchestrator 还在盲取 localIPv4().first"
+
+    # Python 复刻 pickLocalIP 算法，验证真实场景
+    def octets(s):
+        p = s.split(".")
+        return [int(x) for x in p] if len(p) == 4 and all(x.isdigit() for x in p) else None
+    def is_private(s):
+        p = octets(s)
+        if not p: return False
+        return p[0] == 10 or (p[0] == 192 and p[1] == 168) or (p[0] == 172 and 16 <= p[1] <= 31)
+    def pick(all_ips, glasses):
+        if not all_ips: return None
+        gp = octets(glasses) if glasses else None
+        if gp:
+            for ip in all_ips:
+                p = octets(ip)
+                if p and p[:3] == gp[:3]: return ip
+        for ip in all_ips:
+            if is_private(ip): return ip
+        return all_ips[0]
+
+    # 场景 1：16.2.0.0 排首位（虚拟接口），眼镜 192.168.101.133 → 必须选同网段 192.168.101.114
+    ips = ["16.2.0.0", "192.168.101.114", "127.0.0.1"]
+    assert pick(ips, "192.168.101.133") == "192.168.101.114", "同网段优先失败"
+    # 场景 2：无同网段，过滤 16.x，选私有地址
+    assert pick(["16.2.0.0", "10.0.0.5"], "8.8.8.8") == "10.0.0.5", "私有地址优先失败"
+    # 场景 3：热点模式 172.20.10.x
+    assert pick(["16.2.0.0", "172.20.10.1"], "172.20.10.5") == "172.20.10.1"
+    return True
+
+
 def main():
     results = []
     for name, fn in [
@@ -333,6 +374,7 @@ def main():
         ("公钥缺 NUL 必被拒(回归)", test_pubkey_requires_nul),
         ("sync push 字节序列", test_sync_push),
         ("命令构造与 Swift 交叉核对", lambda p, t: test_commands()),
+        ("本机 IP 智能选择(同网段优先)", lambda p, t: test_local_ip_pick()),
     ]:
         transcript = []
         server = FakeAdbd(15999 + len(results), transcript)

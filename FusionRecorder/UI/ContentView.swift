@@ -39,6 +39,7 @@ struct ContentView: View {
 
     // iPhone 端连接（交接包 §5：POC_PC_IP / POC_SCREEN_PORT / POC_CAM_PORT）
     @AppStorage("host") private var host = "192.168.101.133"
+    @AppStorage("iphoneHostIP") private var iphoneHostIP = ""
     @AppStorage("screenPort") private var screenPort = "9114"
     @AppStorage("cameraPort") private var cameraPort = "9115"
 
@@ -225,6 +226,7 @@ struct ContentView: View {
                         .foregroundStyle(Palette.hint)
                         .padding(.top, 2)
                     fieldRow("眼镜 IP", text: $host, decimal: true)
+                    fieldRow("iPhone IP（留空自动）", text: $iphoneHostIP, decimal: true)
                     fieldRow("屏幕流端口（9114）", text: $screenPort, decimal: false)
                     fieldRow("相机流端口（9115）", text: $cameraPort, decimal: false)
 
@@ -242,7 +244,7 @@ struct ContentView: View {
                         }
                     }
                     .padding(.top, 6)
-                    Text("① 只装好眼镜端（自动扫 5555 → ADB 授权 → push → 启动两路）；② 部署完直接开录。眼镜 IP 留上面字段为空则自动扫描。首次 ADB 需在眼镜上点「允许调试」。")
+                    Text("① 只装好眼镜端（自动扫 5555 → ADB 授权 → push → 启动两路）；② 部署完直接开录。眼镜 IP 留空自动扫描；iPhone IP 留空自动选（与眼镜同网段优先），选错可手动填实际局域网 IP。首次 ADB 需在眼镜上点「允许调试」。")
                         .font(.system(size: 11))
                         .foregroundStyle(Palette.hint)
                         .padding(.top, 4)
@@ -474,7 +476,9 @@ struct ContentView: View {
         guard !autoBusy else { return }
         autoBusy = true
         let given = host.trimmingCharacters(in: .whitespacesAndNewlines)
-        orchestrator.run(host: given.isEmpty ? nil : given) { [self] result in
+        let localIP = iphoneHostIP.trimmingCharacters(in: .whitespacesAndNewlines)
+        orchestrator.run(host: given.isEmpty ? nil : given,
+                         iphoneHostIP: localIP.isEmpty ? nil : localIP) { [self] result in
             DispatchQueue.main.async {
                 self.autoBusy = false
             }
@@ -487,7 +491,9 @@ struct ContentView: View {
         session.clearRecordResult()
         session.update(params: fusionParams)
         let given = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        let localIP = iphoneHostIP.trimmingCharacters(in: .whitespacesAndNewlines)
         session.startAuto(host: given.isEmpty ? nil : given,
+                          iphoneHostIP: localIP.isEmpty ? nil : localIP,
                           screenPort: UInt16(screenPort) ?? 9114,
                           cameraPort: UInt16(cameraPort) ?? 9115) { [self] result in
             DispatchQueue.main.async {

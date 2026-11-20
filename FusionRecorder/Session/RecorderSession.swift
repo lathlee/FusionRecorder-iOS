@@ -136,14 +136,15 @@ final class RecorderSession: ObservableObject {
     }
 
     /// 全自动模式：先部署眼镜端，再让 iPhone 监听 9114/9115 等采集端主动接入。
-    func startAuto(host: String? = nil, screenPort: UInt16 = 9114, cameraPort: UInt16 = 9115,
+    func startAuto(host: String? = nil, iphoneHostIP: String? = nil,
+                   screenPort: UInt16 = 9114, cameraPort: UInt16 = 9115,
                    completion: @escaping (Result<Void, Error>) -> Void) {
         guard !isRunning else {
             completion(.failure(ADBError.connectionFailed("正在录制中")))
             return
         }
         append("全自动：发现眼镜 → 部署采集端 → 监听两路 → 录制写相册")
-        orchestrator.run(host: host) { [weak self] result in
+        orchestrator.run(host: host, iphoneHostIP: iphoneHostIP) { [weak self] result in
             guard let self = self else { return }
             switch result {
             case .failure(let error):

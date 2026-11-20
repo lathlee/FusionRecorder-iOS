@@ -66,6 +66,50 @@ final class GlassesDiscovery {
         return result
     }
 
+    /// 选出「下发采集端启动命令时该填的 iPhone IP」——眼镜要主动连这个地址。
+    ///
+    /// 不能盲目取 localIPv4().first：iPhone 上接口顺序不定，首个可能是
+    /// 16.x 的虚拟/VPN 接口（2026-11-20 真机实测取到 16.2.0.0，眼镜连不上）。
+    /// 策略：① 与眼镜同 /24 网段的本机 IP 最优（采集端和它必然可达）；
+    ///       ② 否则取 RFC1918 私有地址（192.168/10/172.16-31）；
+    ///       ③ 再不行退回第一个非 loopback。
+    func bestLocalIP(for glassesIP: String?) -> String? {
+        Self.pickLocalIP(from: localIPv4(), glassesIP: glassesIP)
+    }
+
+    /// 纯函数版（便于离线单测）：从候选 IP 列表里挑出该下发给眼镜的 host。
+    static func pickLocalIP(from all: [String], glassesIP: String?) -> String? {
+        guard !all.isEmpty else { return nil }
+
+        func octets(_ s: String) -> [Int]? {
+            let p = s.split(separator: ".").compactMap { Int($0) }
+            return p.count == 4 ? p : nil
+        }
+        func isPrivate(_ s: String) -> Bool {
+            guard let p = octets(s) else { return false }
+            if p[0] == 10 { return true }
+            if p[0] == 192 && p[1] == 168 { return true }
+            if p[0] == 172 && (16...31).contains(p[1]) { return true }
+            return false
+        }
+
+        // ① 同网段优先
+        if let g = glassesIP, let gp = octets(g) {
+            if let sameSubnet = all.first(where: {
+                guard let p = octets($0) else { return false }
+                return p[0] == gp[0] && p[1] == gp[1] && p[2] == gp[2]
+            }) {
+                return sameSubnet
+            }
+        }
+        // ② 私有地址
+        if let privateIP = all.first(where: { isPrivate($0) }) {
+            return privateIP
+        }
+        // ③ 兜底
+        return all.first
+    }
+
     /// 扫描候选地址：上次成功的 IP 优先，然后本机各网段的 /24。
     func candidateIPs() -> [String] {
         var ordered: [String] = []
