@@ -333,10 +333,13 @@ final class RecorderSession: ObservableObject {
     /// 读取两路的 `<mp4>.meta`：第 1 行首帧绝对 pts，第 2 行结束时刻。
     private func readTrackMetas(adb: ADBClient,
                                 completion: @escaping (TrackMeta?, TrackMeta?) -> Void) {
-        adb.shell("cat \(screenRemotePath).meta 2>/dev/null || echo 0", timeout: 10) { sResult in
+        // 先取局部常量：闭包里引用实例属性要显式 self，用局部值更干净
+        let sPath = screenRemotePath
+        let cPath = cameraRemotePath
+        adb.shell("cat \(sPath).meta 2>/dev/null || echo 0", timeout: 10) { sResult in
             let sText = (try? sResult.get())?
                 .trimmingCharacters(in: .whitespacesAndNewlines) ?? "0"
-            adb.shell("cat \(cameraRemotePath).meta 2>/dev/null || echo 0",
+            adb.shell("cat \(cPath).meta 2>/dev/null || echo 0",
                       timeout: 10) { [weak self] cResult in
                 let cText = (try? cResult.get())?
                     .trimmingCharacters(in: .whitespacesAndNewlines) ?? "0"
