@@ -71,8 +71,15 @@ settings:
     #                 于是既不弹框也不回 CNXN，表现为「永远正在连接」。
     #                 现在自己算 n0inv（32 位牛顿迭代）与 rr（2^4096 mod n），
     #                 算法已与 adb 生成的 adbkey.pub 逐字节对拍通过。
-    MARKETING_VERSION: "0.5.4"
-    CURRENT_PROJECT_VERSION: "26"
+    #         0.5.5 = 扫描阶段的两个坑：
+    #                 ① 「重新扫描」曾把已知 IP 清空，而本机又读不到局域网地址，
+    #                    候选表为空 → 必然「未发现眼镜」，还把唯一可用地址弄丢；
+    #                 ② 读不到局域网地址时永远拼不出 /24 候选，也就永远不去探
+    #                    局域网 IP，iOS 的「本地网络」权限框因此永远不弹 ——
+    #                    死循环。现在始终拿已知 IP 硬探一次，顺手打破这个环。
+    #                 另：部署日志新增「本机接口」一行，失败提示改成可执行的四条。
+    MARKETING_VERSION: "0.5.5"
+    CURRENT_PROJECT_VERSION: "27"
     # 侧载不需要 Apple 签名，签名交给 SideStore / AltStore 用免费 Apple ID 做
     CODE_SIGNING_ALLOWED: "NO"
     CODE_SIGNING_REQUIRED: "NO"

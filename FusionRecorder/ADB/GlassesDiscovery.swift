@@ -140,10 +140,30 @@ final class GlassesDiscovery {
         return pa[0] == pb[0] && pa[1] == pb[1] && pa[2] == pb[2]
     }
 
+    /// 所有接口的 IPv4 清单，纯粹给部署日志看（诊断用）。
+    /// 真机踩过：界面上「本机 IP 未获取到」，但日志里能看到到底有哪些接口、
+    /// 是不是只有 VPN 的 16.x，一眼就能判断问题在哪。
+    func interfaceDump() -> String {
+        let all = localIPv4()
+        if all.isEmpty { return "无（连 127.0.0.1 都没有，异常）" }
+        return all.map { ip in
+            "\\(ip)\\(Self.isPrivateIPv4(ip) ? "" : "（非局域网）")"
+        }.joined(separator: " , ")
+    }
+
     /// 扫描候选地址：上次成功的 IP 优先，然后本机各网段的 /24。
-    func candidateIPs() -> [String] {
+    ///
+    /// ★ 0.5.5：可以额外塞入「已知的眼镜 IP」（手动填的那个）。
+    /// 这一步不只是为了快点找到 —— 它同时**触发 iOS 的「本地网络」权限框**：
+    /// 如果本机一个局域网地址都读不到，就永远拼不出 /24 候选，
+    /// 也就永远不去连局域网 IP，系统于是永远不弹权限框 —— 死循环。
+    /// 用已知 IP 硬探一次，把这个环打断。
+    func candidateIPs(extra: [String] = []) -> [String] {
         var ordered: [String] = []
-        if let last = lastIP { ordered.append(last) }
+        for ip in extra where !ip.isEmpty {
+            if !ordered.contains(ip) { ordered.append(ip) }
+        }
+        if let last = lastIP, !ordered.contains(last) { ordered.append(last) }
         for local in localIPv4() {
             let parts = local.split(separator: ".").compactMap { Int($0) }
             guard parts.count == 4 else { continue }
@@ -159,9 +179,10 @@ final class GlassesDiscovery {
     /// - parameters:
     ///   - progress: 已探测数 / 总数，用于 UI 显示进度
     ///   - completion: 命中的候选；nil 表示整表扫完没有可达设备
-    func scan(progress: ((Int, Int) -> Void)? = nil,
+    func scan(extra: [String] = [],
+              progress: ((Int, Int) -> Void)? = nil,
               completion: @escaping (DiscoveryResult?) -> Void) {
-        let candidates = candidateIPs()
+        let candidates = candidateIPs(extra: extra)
         guard !candidates.isEmpty else {
             completion(nil)
             return

@@ -246,7 +246,12 @@ final class CaptureOrchestrator: ObservableObject {
     // MARK: - 编排
 
     /// 全自动入口。host 传入则跳过扫描（手动指定眼镜 IP）。
+    ///
+    /// extraCandidates：界面上手动填的眼镜 IP。即使本机一个局域网地址都读不到，
+    /// 也会拿它硬探一次 5555 —— 这一步同时触发 iOS 的「本地网络」权限框，
+    /// 否则会陷入死循环（没地址→不探局域网→不弹权限框→还是没地址）。
     func run(host: String? = nil, iphoneHostIP: String? = nil,
+             extraCandidates: [String] = [],
              completion: @escaping (Result<String, Error>) -> Void) {
         guard !isBusy else {
             completion(.failure(ADBError.connectionFailed("已有部署流程在执行")))
@@ -275,16 +280,29 @@ final class CaptureOrchestrator: ObservableObject {
             self.connectAndDeploy(glassesIP: glassesAddress, iphoneIP: phone, completion: completion)
         }
 
+        // 先把网络现状打进日志：界面显示「未获取到局域网 IP」时，
+        // 这一行能直接看出是只有 VPN 接口、还是根本没接口。
+        append("本机接口：\(GlassesDiscovery.shared.interfaceDump)")
+
         if let given = host, !given.isEmpty {
             glassesIP = given
             append("使用指定眼镜 IP：\(given)")
             deploy(to: given)
         } else {
-            setStage(.discovering, "扫描 5555 端口（上次 IP 优先）…")
-            GlassesDiscovery.shared.scan { [weak self] result in
+            let extras = extraCandidates.filter { !$0.isEmpty }
+            setStage(.discovering, extras.isEmpty
+                     ? "扫描 5555 端口（上次 IP 优先）…"
+                     : "先探 \(extras.joined(separator: " / ")) 的 5555…")
+            GlassesDiscovery.shared.scan(extra: extras) { [weak self] result in
                 guard let self = self else { return }
                 guard let found = result else {
-                    self.finishFailure("未发现眼镜：确认眼镜连上 iPhone 热点、无线 ADB 已开（5555）", completion: completion)
+                    // 别只丢一句「未发现」——把「怎么救」写清楚。
+                    let hint = "未发现眼镜：① 确认眼镜和 iPhone 在同一个 WiFi（或眼镜连 iPhone 热点）；"
+                        + "② 确认眼镜的无线 ADB 开着（service.adb.tcp.port=5555）；"
+                        + "③ 若已知 IP，展开「调试与参数 → 连接参数」把「眼镜 IP」填上再点连接；"
+                        + "④ 若本机 IP 一直「未获取到」，去 设置 → 隐私与安全性 → 本地网络，"
+                        + "把「融合录屏」的开关打开（重装 App 后这个权限会掉）。"
+                    self.finishFailure(hint, completion: completion)
                     return
                 }
                 self.glassesIP = found.ip

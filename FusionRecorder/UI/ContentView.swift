@@ -364,6 +364,9 @@ struct ContentView: View {
         if orchestrator.stage == .failed {
             return orchestrator.stageDetail.isEmpty ? "点下方重试连接" : orchestrator.stageDetail
         }
+        if lanIP.isEmpty {
+            return "先确认「本地网络」权限已开，或展开「调试与参数 → 连接参数」手动填眼镜 IP"
+        }
         return "连接后点「刷新预览」抓一帧真实画面\n没抓过帧就不显示旧画面"
     }
 
@@ -526,7 +529,10 @@ struct ContentView: View {
     private var networkWarning: String? {
         if orchestrator.isBusy { return nil }
         if lanIP.isEmpty {
-            return "没取到 iPhone 的局域网 IP：确认已连 WiFi 或已开热点，再点「重新扫描」"
+            // 重装 App 后 iOS 的「本地网络」权限会掉，掉了就读不到局域网地址、
+            // 也连不上局域网设备。这是真机上最常见的一种「莫名其妙连不上」。
+            return "读不到 iPhone 的局域网 IP：到 设置 → 隐私与安全性 → 本地网络，"
+                + "把「融合录屏」打开（重装后这个权限会掉）；已开热点则点「重新扫描」"
         }
         let g = connectionIP
         if g != "—", !GlassesDiscovery.sameSubnet(lanIP, g) {
@@ -870,14 +876,23 @@ struct ContentView: View {
         if ip != lanIP { lanIP = ip }
     }
 
-    /// 重新扫描：忘掉上次 IP，重新在 5555 上找眼镜。
+    /// 重新扫描：把已知 IP 一起拿去找，**不再清空它们**。
+    ///
+    /// 0.5.4 的版本这里干过蠢事 —— 把「眼镜 IP」和「上次成功的 IP」都清空，
+    /// 结果本机又读不到局域网地址，候选表为空，扫描必然「未发现眼镜」，
+    /// 而且把唯一可用的地址也弄丢了（真机截图就是这么卡住的）。
+    /// 现在：有已知 IP 就优先探它，顺便触发 iOS 的「本地网络」权限框。
     private func rescan() {
         guard !orchestrator.isBusy else { return }
-        host = ""
-        GlassesDiscovery.shared.forget()
-        session.appendUser("重新扫描眼镜：忘记上次 IP，开始在 5555 上找…")
+        let typed = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        if typed.isEmpty { host = Self.defaultHost }      // 起码留一个可用地址
+        session.appendUser("重新扫描眼镜：先探已知 IP，再扫本机网段…")
         autoDeploy()
     }
+
+    /// 这副眼镜的地址（DHCP 长期稳定在 .133）。留作「重新扫描」的兜底，
+    /// 也方便手滑清空后一键恢复。
+    private static let defaultHost = "192.168.101.133"
 
     /// 刷新预览：抓屏幕上真实的一帧 + 相机拍一张，合成后立刻显示。
     private func refreshPreview() {
@@ -924,8 +939,12 @@ struct ContentView: View {
         autoBusy = true
         let given = host.trimmingCharacters(in: .whitespacesAndNewlines)
         let localIP = iphoneHostIP.trimmingCharacters(in: .whitespacesAndNewlines)
+        // 即使「眼镜 IP」是空的，也拿兜底地址探一次：既可能直接连上，
+        // 又能触发 iOS 的「本地网络」权限框（没这个权限，扫描永远找不到设备）。
+        let probeList = given.isEmpty ? [Self.defaultHost] : [given]
         orchestrator.run(host: given.isEmpty ? nil : given,
-                         iphoneHostIP: localIP.isEmpty ? nil : localIP) { [self] result in
+                         iphoneHostIP: localIP.isEmpty ? nil : localIP,
+                         extraCandidates: probeList) { [self] result in
             DispatchQueue.main.async {
                 self.autoBusy = false
                 self.refreshLanIP()
