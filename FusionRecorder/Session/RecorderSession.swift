@@ -377,11 +377,31 @@ final class RecorderSession: ObservableObject {
     }
 
     /// 拉一个文件，失败自动重试（最多 3 次）。
-    /// 这条链路只有 0.19~0.28MB/s，60 秒录制要传 14MB，一次失败就整条重来太浪费。
+    /// 这条链路只有 0.2~0.4MB/s，60 秒录制要传 14MB，一次失败就整条重来太浪费。
     private func pullOne(adb: ADBClient, path: String, dest: URL, total: Int?,
                          label: String, isScreen: Bool, attempt: Int = 0,
                          completion: @escaping (Error?) -> Void) {
-        adb.pull(path: path, knownSize: total, progress: { [weak self] ratio in
+        // 拉之前重新 stat 一次。muxer 写完 moov 之前文件还会长（真机实测差 48KB），
+        // 拿早先 waitFiles 的数字去校验，会把一次成功的拉取判成「字节数不符」。
+        adb.shell("stat -c %s \(path) 2>/dev/null || echo 0", timeout: 10) { [weak self] statResult in
+            guard let self = self else { return }
+            let text = (try? statResult.get())?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? "0"
+            let fresh = Int(text) ?? 0
+            if fresh > 0 {
+                if isScreen { self.pullScreenTotal = fresh } else { self.pullCameraTotal = fresh }
+            }
+            self.runPull(adb: adb, path: path, dest: dest,
+                         expect: fresh > 0 ? fresh : total,
+                         label: label, isScreen: isScreen,
+                         attempt: attempt, completion: completion)
+        }
+    }
+
+    private func runPull(adb: ADBClient, path: String, dest: URL, expect: Int?,
+                         label: String, isScreen: Bool, attempt: Int,
+                         completion: @escaping (Error?) -> Void) {
+        adb.pull(path: path, knownSize: expect, progress: { [weak self] ratio in
             guard let self = self else { return }
             if isScreen { self.pullScreenProgress = ratio } else { self.pullCameraProgress = ratio }
             self.updatePullProgress()
@@ -389,21 +409,25 @@ final class RecorderSession: ObservableObject {
             guard let self = self else { return }
             switch result {
             case .success(let data):
-                // 落地前先对字节数：链路这么慢，传到一半断掉但恰好收到 OKAY 的情况
-                // 虽然少见，但一旦发生，后面合成会报「没有视频轨」之类的怪错。
-                if let expected = total, expected > 0, data.count != expected {
+                // 只拦「收少了」（截断）。收多了说明文件在我们 stat 之后又长了，
+                // 这是正常的，不能因此判失败 —— 真机 10:15 就是这样误杀了一次。
+                if let expected = expect, expected > 0, data.count < expected {
                     if attempt < 2 {
-                        self.append("\(label) mp4 字节数不符（\(data.count)/\(expected)），重试…")
+                        self.append("\(label) mp4 收到 \(data.count)/\(expected) 字节，重试…")
                         if isScreen { self.pullScreenProgress = 0 } else { self.pullCameraProgress = 0 }
                         DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-                            self.pullOne(adb: adb, path: path, dest: dest, total: total,
+                            self.pullOne(adb: adb, path: path, dest: dest, total: expect,
                                          label: label, isScreen: isScreen,
                                          attempt: attempt + 1, completion: completion)
                         }
                         return
                     }
-                    completion(ADBSyncPullError.rejected("字节数不符 \(data.count)/\(expected)"))
+                    completion(ADBSyncPullError.rejected("字节数不足 \(data.count)/\(expected)"))
                     return
+                }
+                if let expected = expect, expected > 0, data.count != expected {
+                    self.append("\(label) mp4 收到 \(data.count) 字节，比 stat 的 \(expected) 多"
+                                + "（文件在 stat 之后又封口了），按实际收到的算")
                 }
                 do {
                     try data.write(to: dest)
@@ -420,7 +444,7 @@ final class RecorderSession: ObservableObject {
                                 + "3 秒后重试（\(attempt + 2)/3）…")
                     if isScreen { self.pullScreenProgress = 0 } else { self.pullCameraProgress = 0 }
                     DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
-                        self.pullOne(adb: adb, path: path, dest: dest, total: total,
+                        self.pullOne(adb: adb, path: path, dest: dest, total: expect,
                                      label: label, isScreen: isScreen,
                                      attempt: attempt + 1, completion: completion)
                     }

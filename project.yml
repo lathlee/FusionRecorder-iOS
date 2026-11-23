@@ -40,8 +40,10 @@ settings:
     # 0.4.5 = 修「拉相机 mp4 超时」：超时改统一空闲看门狗（数据在流就永不超时）/
     #         单路失败自动重试 3 次 / 字节数校验 / 进度条带 MB·速率·剩余秒数
     #         0.4.6 追加：失败后「重试传输并合成」按钮（本地已有文件就直接合成）
-    MARKETING_VERSION: "0.4.6"
-    CURRENT_PROJECT_VERSION: "17"
+    #         0.4.7 = 修「传输完成却报失败」：等到 .meta 才算写完 + 拉前重新 stat，
+    #                 字节校验只拦「收少了」，收多了（文件封口后又长）按实际算
+    MARKETING_VERSION: "0.4.7"
+    CURRENT_PROJECT_VERSION: "18"
     # 侧载不需要 Apple 签名，签名交给 SideStore / AltStore 用免费 Apple ID 做
     CODE_SIGNING_ALLOWED: "NO"
     CODE_SIGNING_REQUIRED: "NO"

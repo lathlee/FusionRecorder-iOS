@@ -135,11 +135,23 @@ final class CaptureOrchestrator: ObservableObject {
         "am startservice -n com.fusion.capture/.CameraStreamService -a com.fusion.capture.STOP_CAMERA"
     }
 
-    /// 等两个 mp4 写完：连续两次采样大小一致且非零。
+    /// 等两个 mp4 写完：**必须看到 `<mp4>.meta` 才算完**。
+    ///
+    /// 只看「两次采样大小一致」不够：muxer 在写 moov 之前会有一次停顿，
+    /// 0.5 秒内两次采样可能相同，于是提前判 READY。实测真机就踩了 ——
+    /// 判 READY 时相机 mp4 是 10739744，最终是 10788082（差 48KB 的 moov），
+    /// 结果拉回来的字节数「对不上」，一次成功的传输被判成失败。
+    /// meta 是 muxer.stop() 之后才写的，它的存在就等于「文件已封口」。
     static func waitFilesCommand() -> String {
         let s = screenMP4Path
         let c = cameraMP4Path
-        return "s1=$(stat -c %s \(s) 2>/dev/null || echo 0); c1=$(stat -c %s \(c) 2>/dev/null || echo 0); sleep 0.5; s2=$(stat -c %s \(s) 2>/dev/null || echo 0); c2=$(stat -c %s \(c) 2>/dev/null || echo 0); if [ \"$s1\" = \"$s2\" ] && [ \"$c1\" = \"$c2\" ] && [ \"$s1\" != \"0\" ] && [ \"$c1\" != \"0\" ]; then echo READY screen=$s2 camera=$c2; else echo WAITING screen=$s2/$s1 camera=$c2/$c1; fi"
+        return "s1=$(stat -c %s \(s) 2>/dev/null || echo 0); c1=$(stat -c %s \(c) 2>/dev/null || echo 0); "
+            + "sleep 0.5; s2=$(stat -c %s \(s) 2>/dev/null || echo 0); c2=$(stat -c %s \(c) 2>/dev/null || echo 0); "
+            + "if [ \"$s1\" = \"$s2\" ] && [ \"$c1\" = \"$c2\" ] && [ \"$s1\" != \"0\" ] && [ \"$c1\" != \"0\" ] "
+            + "&& [ -f \(s).meta ] && [ -f \(c).meta ]; "
+            + "then echo READY screen=$s2 camera=$c2; "
+            + "else echo WAITING screen=$s2/$s1 camera=$c2/$c1 "
+            + "meta=$( [ -f \(s).meta ] && echo s1 || echo s0 )$( [ -f \(c).meta ] && echo c1 || echo c0 ); fi"
     }
 
     static func stopCameraCommand() -> String {
