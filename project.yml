@@ -51,8 +51,10 @@ settings:
     #                 ② 界面重排：预览置顶、三按钮（开始/相册/刷新预览）、连接信息栏，
     #                   提示语与调试参数日志默认收起；
     #                 ③ 刷新预览：screencap + APK SNAPSHOT 抓真实两帧再合成
-    MARKETING_VERSION: "0.5.0"
-    CURRENT_PROJECT_VERSION: "21"
+    #         0.5.1 = 真机命令修正：快照改用 start-foreground-service（Android 9 拒绝
+    #                 后台服务启动）；设备型号改用两行 echo（竖线被 shell 当管道吃掉）
+    MARKETING_VERSION: "0.5.1"
+    CURRENT_PROJECT_VERSION: "22"
     # 侧载不需要 Apple 签名，签名交给 SideStore / AltStore 用免费 Apple ID 做
     CODE_SIGNING_ALLOWED: "NO"
     CODE_SIGNING_REQUIRED: "NO"

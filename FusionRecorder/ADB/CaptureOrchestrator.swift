@@ -202,9 +202,13 @@ final class CaptureOrchestrator: ObservableObject {
     }
 
     /// 相机快照：App uid 的前台服务用 ImageReader 拍一张 JPEG，写完再写 `.done` 标记。
+    ///
+    /// 必须用 `start-foreground-service`：眼镜是 Android 9，从 shell 用 `startservice`
+    /// 拉起一个处于后台的 App 服务会被拒 —— 真机实测报
+    /// `Background start not allowed: service Intent {...}`，快照永远等不到。
     static func cameraSnapshotCommand() -> String {
         "rm -f \(cameraSnapshotPath) \(cameraSnapshotPath).done; "
-            + "am startservice -n com.fusion.capture/.CameraStreamService "
+            + "am start-foreground-service -n com.fusion.capture/.CameraStreamService "
             + "-a com.fusion.capture.SNAPSHOT --es snapshot \(cameraSnapshotPath)"
     }
 
@@ -219,9 +223,11 @@ final class CaptureOrchestrator: ObservableObject {
     }
 
     /// 眼镜身份信息：型号 + 序列号，用于界面上的「当前连接」栏。
-    /// 输出格式固定为 `MODEL=<x>|SERIAL=<y>`，方便直接字符串解析。
+    /// 两条 echo 各占一行（`MODEL=…` / `SERIAL=…`）。
+    /// 注意不能用 `echo A=$(..)|B=$(..)` 这种竖线分隔 —— shell 会把 `|` 当管道，
+    /// 整条命令静默返回空字符串（真机踩过）。
     static func deviceInfoCommand() -> String {
-        "echo MODEL=$(getprop ro.product.model)|SERIAL=$(getprop ro.serialno)"
+        "echo MODEL=$(getprop ro.product.model); echo SERIAL=$(getprop ro.serialno)"
     }
 
     static func forceStopCommand() -> String {
@@ -466,11 +472,13 @@ final class CaptureOrchestrator: ObservableObject {
             guard let self = self, !text.isEmpty else { done(); return }
             var model = ""
             var serial = ""
-            for part in text.split(separator: "|") {
-                let kv = part.split(separator: "=", maxSplits: 1)
-                guard kv.count == 2 else { continue }
-                let key = kv[0].trimmingCharacters(in: .whitespaces)
-                let value = kv[1].trimmingCharacters(in: .whitespaces)
+            // 输出是两行 MODEL=… / SERIAL=…（adb 会带回 \r）
+            for rawLine in text.split(whereSeparator: { $0 == "\n" || $0 == "\r" }) {
+                let line = rawLine.trimmingCharacters(in: .whitespaces)
+                guard let eq = line.firstIndex(of: "=") else { continue }
+                let key = String(line[line.startIndex..<eq]).trimmingCharacters(in: .whitespaces)
+                let value = String(line[line.index(after: eq)...])
+                    .trimmingCharacters(in: .whitespaces)
                 if key == "MODEL" { model = value }
                 if key == "SERIAL" { serial = value }
             }
