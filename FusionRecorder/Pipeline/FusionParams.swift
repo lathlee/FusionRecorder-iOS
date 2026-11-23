@@ -49,6 +49,13 @@ struct FusionParams: Equatable {
     var contrast: Double = 1.0         // 摄像头对比度
     var crop: Double = 0.06            // 裁掉屏幕内容右侧（悬浮球不入镜）
 
+    // MARK: - 声音（0.5.0）
+
+    /// 成片音量倍数。1.0 = 原始音量；>1 放大，<1 衰减。
+    /// 只作用于**之后**合成的新成片（已经存进相册的文件不会被改动），
+    /// 实现方式是 AVMutableAudioMix 的 setVolume，不重新编码音轨。
+    var audioVolume: Double = 1.0
+
     // MARK: - Android 端固定值（UI 未暴露，但成片里真实生效，必须同步）
 
     var cameraBrightness: Double = 0.0
@@ -83,7 +90,9 @@ struct FusionParams: Equatable {
     /// 否则圆角/边缘渐隐/裁切会跟着控件大小漂移。
     var renderSize: (width: Int, height: Int) { (canvasWidth, canvasHeight) }
 
-    /// 用于日志/校验：把所有参数打成一个稳定字符串
+    /// 用于日志/校验：把所有**影响画面**的参数打成一个稳定字符串。
+    /// 注意：`audioVolume` 故意不进 fingerprint —— 预览只渲染画面，
+    /// 拖音量滑杆不该触发上千帧的重新合成。
     var fingerprint: String {
         let values: [Double] = [alpha, scale, offsetX, offsetY, additive, corner,
                                 edgeFade, brightness, contrast, crop,

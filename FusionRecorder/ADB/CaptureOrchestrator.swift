@@ -38,6 +38,9 @@ final class CaptureOrchestrator: ObservableObject {
     @Published private(set) var isBusy = false
     @Published private(set) var glassesIP: String?
     @Published private(set) var iphoneIP: String?
+    /// 眼镜型号 / 序列号（部署成功后读取，供界面「当前连接」栏显示）
+    @Published private(set) var deviceModel = ""
+    @Published private(set) var deviceSerial = ""
 
     /// 已授权的那条 ADB 连接（部署完成后 RecorderSession 直接复用，
     /// 不再另开第二条 —— 真机上第二条连接经常卡在 AUTH/PUBLICKEY 上不返回）。
@@ -57,6 +60,12 @@ final class CaptureOrchestrator: ObservableObject {
 
     static func grantCameraCommand() -> String {
         "pm grant com.fusion.capture android.permission.CAMERA"
+    }
+
+    /// 0.5.0：录音权限。和 CAMERA 一样用 pm grant 静默授予，设备上不弹框。
+    /// 失败不致命 —— 采集端会降级成静音录制。
+    static func grantAudioCommand() -> String {
+        "pm grant com.fusion.capture android.permission.RECORD_AUDIO"
     }
 
     /// 屏幕流用 shellDetached：sec=0 永不返回，通道保持打开。
@@ -83,6 +92,14 @@ final class CaptureOrchestrator: ObservableObject {
     /// App 可写，shell(ADB pull) 也能读（sdcardfs 按目录归属映射）。
     static let cameraMP4Dir = "/sdcard/Android/data/com.fusion.capture/files"
     static let cameraMP4Path = cameraMP4Dir + "/fusion_camera.mp4"
+    /// 0.5.0：麦克风单独录成同名 .m4a（AAC-LC 44.1kHz 单声道）。
+    /// 独立文件而不是塞进相机 mp4 的第二条轨 —— 多轨会让 MediaMuxer 改写首样本
+    /// 时间基准，`.meta` 里的绝对 pts 就不再能对齐两路画面。
+    static let cameraAudioPath = cameraMP4Dir + "/fusion_camera.m4a"
+    /// 「刷新预览」用的相机单张快照
+    static let cameraSnapshotPath = cameraMP4Dir + "/fusion_snapshot.jpg"
+    /// 「刷新预览」用的屏幕截图（shell 写 /data/local/tmp，App uid 写不进去）
+    static let screenSnapshotPath = "/data/local/tmp/fusion_screen.png"
     static let screenStopFlag = "/data/local/tmp/fusion_stop_screen"
 
     /// 录制前的准备：确保相机目录存在、清掉上次的停止标记、把屏幕叫醒并保持常亮。
@@ -94,7 +111,9 @@ final class CaptureOrchestrator: ObservableObject {
         // 就绪检查会被旧文件骗过，拉回来的是上一条片子。
         "mkdir -p \(cameraMP4Dir); rm -f \(screenStopFlag) "
             + "\(screenMP4Path) \(screenMP4Path).meta "
-            + "\(cameraMP4Path) \(cameraMP4Path).meta; "
+            + "\(cameraMP4Path) \(cameraMP4Path).meta "
+            + "\(cameraAudioPath) \(cameraAudioPath).meta "
+            + "\(cameraSnapshotPath) \(cameraSnapshotPath).done; "
             + "input keyevent KEYCODE_WAKEUP; "
             + "settings put system screen_off_timeout 1800000; "
             + "svc power stayon true"
@@ -172,6 +191,37 @@ final class CaptureOrchestrator: ObservableObject {
 
     static func stopCameraCommand() -> String {
         "am broadcast -a com.fusion.capture.STOP_CAMERA -n com.fusion.capture/.CaptureReceiver"
+    }
+
+    // MARK: - 0.5.0 刷新预览（抓屏幕 + 相机各一张真实画面）
+
+    /// 屏幕截图：shell 的 screencap 直接落 PNG，几十 KB，比拉视频快两个数量级。
+    static func screenSnapshotCommand() -> String {
+        "screencap -p \(screenSnapshotPath) >/dev/null 2>&1; chmod 644 \(screenSnapshotPath); "
+            + "ls -l \(screenSnapshotPath) 2>/dev/null | awk '{print $5}'"
+    }
+
+    /// 相机快照：App uid 的前台服务用 ImageReader 拍一张 JPEG，写完再写 `.done` 标记。
+    static func cameraSnapshotCommand() -> String {
+        "rm -f \(cameraSnapshotPath) \(cameraSnapshotPath).done; "
+            + "am startservice -n com.fusion.capture/.CameraStreamService "
+            + "-a com.fusion.capture.SNAPSHOT --es snapshot \(cameraSnapshotPath)"
+    }
+
+    /// 轮询快照是否落地（App 拍照 + 存盘约 2~4 秒，给 15 轮 × 0.6 秒）。
+    static func waitSnapshotCommand() -> String {
+        let p = cameraSnapshotPath
+        return "ok=0; i=0; while [ $i -lt 15 ]; do "
+            + "if [ -f \(p).done ]; then ok=1; break; fi; "
+            + "sleep 0.6; i=$((i+1)); done; "
+            + "if [ \"$ok\" = \"1\" ]; then echo READY size=$(stat -c %s \(p) 2>/dev/null || echo 0); "
+            + "else echo WAITING meta=$( [ -f \(p) ] && echo f1 || echo f0 ); fi"
+    }
+
+    /// 眼镜身份信息：型号 + 序列号，用于界面上的「当前连接」栏。
+    /// 输出格式固定为 `MODEL=<x>|SERIAL=<y>`，方便直接字符串解析。
+    static func deviceInfoCommand() -> String {
+        "echo MODEL=$(getprop ro.product.model)|SERIAL=$(getprop ro.serialno)"
     }
 
     static func forceStopCommand() -> String {
@@ -373,21 +423,62 @@ final class CaptureOrchestrator: ObservableObject {
                     self.finishFailure("授权相机失败：\(error.localizedDescription)", completion: completion)
                 case .success(let grantOut):
                     self.append("CAMERA 权限已授予 \(grantOut.trimmingCharacters(in: .whitespacesAndNewlines))")
-                    // 落地确认：包真的装上了才算部署完成
-                    client.shell("pm path com.fusion.capture") { pathResult in
-                        let path = (try? pathResult.get())?
-                            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                        guard path.contains("package:") else {
-                            self.finishFailure("采集端没装上（pm path 为空）：\(path)", completion: completion)
-                            return
+                    // 0.5.0：录音权限同样静默授予。失败只警告（采集端会降级成静音录制），
+                    // 不能因为拿不到麦克风就整个部署失败。
+                    client.shell(Self.grantAudioCommand()) { audioResult in
+                        if case .failure(let e) = audioResult {
+                            self.append("⚠︎ RECORD_AUDIO 授权失败（将静音录制）：\(e.localizedDescription)")
+                        } else {
+                            self.append("RECORD_AUDIO 权限已授予")
                         }
-                        self.append("已确认安装：\(path)")
-                        // 0.4.0：部署阶段只负责把采集端装好。启动本地录制、停止、
-                        // ADB pull 都由 RecorderSession 复用这条已授权的连接完成，
-                        // 不再按 0.3.x 的方式启动实时推流（9114/9115）。
-                        self.finishSuccess("采集端已部署（离线录制模式）", completion: completion)
+                        self.confirmInstalledAndFinish(client: client, completion: completion)
                     }
                 }
+            }
+        }
+    }
+
+    /// 部署收尾：确认包真的装上了，并取一次眼镜型号/序列号给界面用。
+    private func confirmInstalledAndFinish(client: ADBClient,
+                                           completion: @escaping (Result<String, Error>) -> Void) {
+        // 落地确认：包真的装上了才算部署完成
+        client.shell("pm path com.fusion.capture") { pathResult in
+            let path = (try? pathResult.get())?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard path.contains("package:") else {
+                self.finishFailure("采集端没装上（pm path 为空）：\(path)", completion: completion)
+                return
+            }
+            self.append("已确认安装：\(path)")
+            self.fetchDeviceInfo(client: client) {
+                // 0.4.0：部署阶段只负责把采集端装好。启动本地录制、停止、
+                // ADB pull 都由 RecorderSession 复用这条已授权的连接完成，
+                // 不再按 0.3.x 的方式启动实时推流（9114/9115）。
+                self.finishSuccess("采集端已部署（离线录制模式）", completion: completion)
+            }
+        }
+    }
+
+    /// 读眼镜型号与序列号，失败不影响部署结果。
+    private func fetchDeviceInfo(client: ADBClient, done: @escaping () -> Void) {
+        client.shell(Self.deviceInfoCommand(), timeout: 15) { [weak self] result in
+            let text = (try? result.get())?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard let self = self, !text.isEmpty else { done(); return }
+            var model = ""
+            var serial = ""
+            for part in text.split(separator: "|") {
+                let kv = part.split(separator: "=", maxSplits: 1)
+                guard kv.count == 2 else { continue }
+                let key = kv[0].trimmingCharacters(in: .whitespaces)
+                let value = kv[1].trimmingCharacters(in: .whitespaces)
+                if key == "MODEL" { model = value }
+                if key == "SERIAL" { serial = value }
+            }
+            DispatchQueue.main.async {
+                if !model.isEmpty { self.deviceModel = model }
+                if !serial.isEmpty { self.deviceSerial = serial }
+                self.append("眼镜：\(model) · \(serial)")
+                done()
             }
         }
     }

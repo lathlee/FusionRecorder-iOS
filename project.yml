@@ -46,8 +46,13 @@ settings:
     #                 原来只采样一次，相机 drain EOS 慢过 0.5 秒就会立刻判「没写完」
     #         0.4.9 = 录制前删掉上一次的 mp4 和 .meta：上传失败时旧文件会留在眼镜上，
     #                 而 .meta 是「已封口」判据，旧文件会让就绪检查误判、拉回上一条片子
-    MARKETING_VERSION: "0.4.9"
-    CURRENT_PROJECT_VERSION: "20"
+    #         0.5.0 = ① 录到声音：眼镜端 AAC 单声道音轨（独立 .m4a）+ iPhone 端
+    #                   AVMutableComposition 按绝对 pts 并入成片，音量由「合成音量」滑杆控制；
+    #                 ② 界面重排：预览置顶、三按钮（开始/相册/刷新预览）、连接信息栏，
+    #                   提示语与调试参数日志默认收起；
+    #                 ③ 刷新预览：screencap + APK SNAPSHOT 抓真实两帧再合成
+    MARKETING_VERSION: "0.5.0"
+    CURRENT_PROJECT_VERSION: "21"
     # 侧载不需要 Apple 签名，签名交给 SideStore / AltStore 用免费 Apple ID 做
     CODE_SIGNING_ALLOWED: "NO"
     CODE_SIGNING_REQUIRED: "NO"

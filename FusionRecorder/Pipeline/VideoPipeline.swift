@@ -211,6 +211,21 @@ final class MovieWriter {
 
     /// 结束录制：标记 input finished → finishWriting → 保存到相册。
     func finish(completion: @escaping (Result<URL, Error>) -> Void) {
+        finishWithoutSaving { result in
+            switch result {
+            case .success(let url):
+                Self.saveToAlbum(url: url, completion: completion)
+            case .failure(let error):
+                completion(.failure(error))
+            }
+        }
+    }
+
+    /// 只把文件写完，**不**存相册。
+    ///
+    /// 0.5.0 需要它：离线合成先在临时目录写出一版「只有画面」的 mp4，
+    /// 再把眼镜录的音轨并进去，最后才存相册。中间那一版不能出现在相册里。
+    func finishWithoutSaving(completion: @escaping (Result<URL, Error>) -> Void) {
         guard state == .writing else {
             completion(.failure(PipelineError.invalidState("finish 时状态 \(state)")))
             return
@@ -234,7 +249,7 @@ final class MovieWriter {
                 return
             }
             self.state = .finished
-            self.saveToPhotoLibrary(url: url, completion: completion)
+            completion(.success(url))
         }
     }
 
@@ -255,7 +270,8 @@ final class MovieWriter {
 
     // MARK: - 私有
 
-    private func saveToPhotoLibrary(url: URL, completion: @escaping (Result<URL, Error>) -> Void) {
+    /// 把成片存进相册（合成与存盘分开后，这一步由 OfflineCompositor 显式调用）。
+    static func saveToAlbum(url: URL, completion: @escaping (Result<URL, Error>) -> Void) {
         PHPhotoLibrary.shared().performChanges({
             PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: url)
         }) { success, error in

@@ -71,11 +71,16 @@ final class RecorderSession: ObservableObject {
         if haveScreen && haveCamera {
             append("重试：两个 mp4 本地已完整，直接重新合成")
             setPhase(.composing, "重新离线合成…")
-            readTrackMetas(adb: adb) { [weak self] sMeta, cMeta in
+            let audio = audioLocalURL.flatMap { url -> URL? in
+                let n = size(url)
+                return n > 0 ? url : nil
+            }
+            readTrackMetas(adb: adb) { [weak self] sMeta, cMeta, aMeta in
                 guard let self = self else { return }
                 self.composeOffline(screenURL: screenURL, cameraURL: cameraURL,
                                     outputURL: outputURL,
-                                    screenMeta: sMeta, cameraMeta: cMeta)
+                                    audioURL: audio, screenMeta: sMeta,
+                                    cameraMeta: cMeta, audioMeta: aMeta)
             }
         } else {
             append("重试：重新拉取 mp4（眼镜上的文件还在）")
@@ -108,8 +113,11 @@ final class RecorderSession: ObservableObject {
     // 远端与本地文件路径
     private let screenRemotePath = "/data/local/tmp/fusion_screen.mp4"
     private let cameraRemotePath = "/sdcard/Android/data/com.fusion.capture/files/fusion_camera.mp4"
+    /// 0.5.0：麦克风音轨（AAC-LC）。独立文件，拉回来后在合成阶段并进成片。
+    private let audioRemotePath = "/sdcard/Android/data/com.fusion.capture/files/fusion_camera.m4a"
     private var screenLocalURL: URL?
     private var cameraLocalURL: URL?
+    private var audioLocalURL: URL?
     private var outputLocalURL: URL?
 
     private var pullScreenProgress: Double = 0
@@ -259,6 +267,7 @@ final class RecorderSession: ObservableObject {
         let tmp = FileManager.default.temporaryDirectory
         screenLocalURL = tmp.appendingPathComponent("fusion_screen_\(stamp).mp4")
         cameraLocalURL = tmp.appendingPathComponent("fusion_camera_\(stamp).mp4")
+        audioLocalURL = tmp.appendingPathComponent("fusion_audio_\(stamp).m4a")
         outputLocalURL = tmp.appendingPathComponent("fusion_rec_\(stamp).mp4")
         pullScreenProgress = 0
         pullCameraProgress = 0
@@ -365,14 +374,56 @@ final class RecorderSession: ObservableObject {
                     self.fail("拉取相机 mp4 失败：\(error.localizedDescription)")
                     return
                 }
-                // 先读眼镜写下的绝对时间信息（首帧 pts + 真实结束时刻）
-                self.readTrackMetas(adb: adb) { screenMeta, cameraMeta in
-                    adb.shell("rm -f \(self.screenRemotePath) \(self.screenRemotePath).meta "
-                              + "\(self.cameraRemotePath) \(self.cameraRemotePath).meta; "
-                              + CaptureOrchestrator.restorePowerCommand()) { _ in }
-                    self.composeOffline(screenURL: screenURL, cameraURL: cameraURL,
-                                        outputURL: outputURL,
-                                        screenMeta: screenMeta, cameraMeta: cameraMeta)
+                // 0.5.0：音轨（可选，失败只让成片变静音，不中断流程）
+                self.pullAudioIfPresent(adb: adb) { audioURL in
+                    // 先读眼镜写下的绝对时间信息（首帧 pts + 真实结束时刻）
+                    self.readTrackMetas(adb: adb) { screenMeta, cameraMeta, audioMeta in
+                        adb.shell("rm -f \(self.screenRemotePath) \(self.screenRemotePath).meta "
+                                  + "\(self.cameraRemotePath) \(self.cameraRemotePath).meta "
+                                  + "\(self.audioRemotePath) \(self.audioRemotePath).meta; "
+                                  + CaptureOrchestrator.restorePowerCommand()) { _ in }
+                        self.composeOffline(screenURL: screenURL, cameraURL: cameraURL,
+                                            outputURL: outputURL,
+                                            audioURL: audioURL,
+                                            screenMeta: screenMeta,
+                                            cameraMeta: cameraMeta,
+                                            audioMeta: audioMeta)
+                    }
+                }
+            }
+        }
+    }
+
+    /// 拉音轨（可选）。眼镜端没有 RECORD_AUDIO 或音频启动失败时，远端就没有这个文件；
+    /// 这种情况直接跳过，成片出无声版 —— 不能因为没声音就让整次录制失败。
+    private func pullAudioIfPresent(adb: ADBClient, completion: @escaping (URL?) -> Void) {
+        guard let dest = audioLocalURL else { completion(nil); return }
+        let remote = audioRemotePath
+        adb.shell("stat -c %s \(remote) 2>/dev/null || echo 0", timeout: 10) { [weak self] result in
+            guard let self = self else { return }
+            let text = (try? result.get())?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "0"
+            let size = Int(text) ?? 0
+            guard size > 0 else {
+                self.append("⚠︎ 眼镜上没有音轨（可能未授予麦克风权限），成片将无声")
+                completion(nil)
+                return
+            }
+            self.append("拉取音轨（\(size) 字节）…")
+            adb.pull(path: remote, knownSize: size) { [weak self] pullResult in
+                guard let self = self else { return }
+                switch pullResult {
+                case .success(let data):
+                    do {
+                        try data.write(to: dest)
+                        self.append("音轨已拉取（\(data.count) 字节）")
+                        completion(dest)
+                    } catch {
+                        self.append("⚠︎ 音轨写本地失败：\(error.localizedDescription)")
+                        completion(nil)
+                    }
+                case .failure(let error):
+                    self.append("⚠︎ 音轨拉取失败：\(error.localizedDescription)（成片将无声）")
+                    completion(nil)
                 }
             }
         }
@@ -457,24 +508,32 @@ final class RecorderSession: ObservableObject {
         }
     }
 
-    /// 读取两路的 `<mp4>.meta`：第 1 行首帧绝对 pts，第 2 行结束时刻。
+    /// 读取三路的 `<文件>.meta`：第 1 行首帧绝对 pts，第 2 行结束时刻。
     private func readTrackMetas(adb: ADBClient,
-                                completion: @escaping (TrackMeta?, TrackMeta?) -> Void) {
+                                completion: @escaping (TrackMeta?, TrackMeta?, TrackMeta?) -> Void) {
         // 先取局部常量：闭包里引用实例属性要显式 self，用局部值更干净
         let sPath = screenRemotePath
         let cPath = cameraRemotePath
+        let aPath = audioRemotePath
         adb.shell("cat \(sPath).meta 2>/dev/null || echo 0", timeout: 10) { sResult in
             let sText = (try? sResult.get())?
                 .trimmingCharacters(in: .whitespacesAndNewlines) ?? "0"
             adb.shell("cat \(cPath).meta 2>/dev/null || echo 0",
-                      timeout: 10) { [weak self] cResult in
+                      timeout: 10) { cResult in
                 let cText = (try? cResult.get())?
                     .trimmingCharacters(in: .whitespacesAndNewlines) ?? "0"
-                let sMeta = Self.parseTrackMeta(sText)
-                let cMeta = Self.parseTrackMeta(cText)
-                self?.append("时间标记：屏幕=\(sText.replacingOccurrences(of: "\n", with: "/")) "
-                             + "相机=\(cText.replacingOccurrences(of: "\n", with: "/"))")
-                completion(sMeta, cMeta)
+                adb.shell("cat \(aPath).meta 2>/dev/null || echo 0",
+                          timeout: 10) { [weak self] aResult in
+                    let aText = (try? aResult.get())?
+                        .trimmingCharacters(in: .whitespacesAndNewlines) ?? "0"
+                    let sMeta = Self.parseTrackMeta(sText)
+                    let cMeta = Self.parseTrackMeta(cText)
+                    let aMeta = Self.parseTrackMeta(aText)
+                    self?.append("时间标记：屏幕=\(sText.replacingOccurrences(of: "\n", with: "/")) "
+                                 + "相机=\(cText.replacingOccurrences(of: "\n", with: "/")) "
+                                 + "音频=\(aText.replacingOccurrences(of: "\n", with: "/"))")
+                    completion(sMeta, cMeta, aMeta)
+                }
             }
         }
     }
@@ -511,8 +570,11 @@ final class RecorderSession: ObservableObject {
     }
 
     private func composeOffline(screenURL: URL, cameraURL: URL, outputURL: URL,
-                                screenMeta: TrackMeta?, cameraMeta: TrackMeta?) {
-        setPhase(.composing, "离线合成中（两路按绝对 pts 对齐，按短的那路裁剪）…")
+                                audioURL: URL?, screenMeta: TrackMeta?,
+                                cameraMeta: TrackMeta?, audioMeta: TrackMeta?) {
+        setPhase(.composing, audioURL == nil
+                 ? "离线合成中（无音轨，按绝对 pts 对齐画面）…"
+                 : "离线合成中（画面 + 音轨，音量 ×\(String(format: "%.2f", params.audioVolume))）…")
         let params = self.params
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
@@ -523,7 +585,9 @@ final class RecorderSession: ObservableObject {
                     outputURL: outputURL,
                     params: params,
                     screenMeta: screenMeta,
-                    cameraMeta: cameraMeta) { ratio in
+                    cameraMeta: cameraMeta,
+                    audioURL: audioURL,
+                    audioMeta: audioMeta) { ratio in
                         DispatchQueue.main.async { [weak self] in
                             guard let self = self else { return }
                             self.offlineProgress = ratio
@@ -539,6 +603,11 @@ final class RecorderSession: ObservableObject {
                     self.append("成片已保存相册：\(result.frameCount) 帧 / "
                                 + String(format: "%.1fs", Double(result.durationUs) / 1e6)
                                 + "（按短的那路裁剪）")
+                    if result.hasAudio {
+                        self.append(String(format: "音轨已并入成片（音量 ×%.2f）", params.audioVolume))
+                    } else {
+                        self.append("这段成片没有音轨（眼镜端未录到声音，或未授予麦克风权限）")
+                    }
                 }
             } catch {
                 DispatchQueue.main.async {
@@ -648,6 +717,164 @@ final class RecorderSession: ObservableObject {
         captureCameraReceiver?.stop()
         captureScreenReceiver = nil
         captureCameraReceiver = nil
+    }
+
+    // MARK: - 刷新预览（0.5.0）：抓屏幕 + 相机各一张真实画面
+
+    @Published private(set) var previewBusy = false
+    @Published private(set) var previewNote = ""
+
+    /// 专门用于抓帧预览的连接（部署流程没跑过时自己建一条，用完保留复用）
+    private var previewAdb: ADBClient?
+
+    /// 抓一帧屏幕 + 一帧相机，交给 FrameStore 重新合成预览图。
+    /// 屏幕走 shell 的 `screencap`（几十 KB），相机走 APK 的 SNAPSHOT 动作（640×480 JPEG），
+    /// 两者都不需要录视频，全程两三秒。
+    func refreshPreview(host: String?, completion: @escaping (Result<String, Error>) -> Void) {
+        guard !isRunning else {
+            completion(.failure(ADBError.connectionFailed("正在录制，先停止再刷新预览")))
+            return
+        }
+        guard !previewBusy else {
+            completion(.failure(ADBError.connectionFailed("上一次刷新还没结束")))
+            return
+        }
+        previewBusy = true
+        previewNote = "正在连接眼镜…"
+        append("刷新预览：抓一帧屏幕 + 一帧相机")
+
+        clientForPreview(host: host) { [weak self] clientResult in
+            guard let self = self else { return }
+            switch clientResult {
+            case .failure(let error):
+                self.finishPreview(nil, nil, error: error.localizedDescription, completion: completion)
+            case .success(let client):
+                self.grabScreenShot(client: client) { screenImage, screenError in
+                    guard let screenImage = screenImage else {
+                        self.finishPreview(nil, nil,
+                                           error: "屏幕截图失败：\(screenError ?? "未知")",
+                                           completion: completion)
+                        return
+                    }
+                    self.previewNote = "屏幕已抓到，正在拍相机…"
+                    self.grabCameraShot(client: client) { cameraImage, cameraError in
+                        guard let cameraImage = cameraImage else {
+                            self.finishPreview(screenImage, nil,
+                                               error: "相机快照失败：\(cameraError ?? "未知")",
+                                               completion: completion)
+                            return
+                        }
+                        self.finishPreview(screenImage, cameraImage, error: nil,
+                                           completion: completion)
+                    }
+                }
+            }
+        }
+    }
+
+    private func finishPreview(_ screen: CGImage?, _ camera: CGImage?,
+                               error: String?,
+                               completion: @escaping (Result<String, Error>) -> Void) {
+        if let s = screen, let c = camera {
+            frameStore?.applyGlassesFrames(screen: s, camera: c)
+            previewNote = "已抓取眼镜当前画面（屏幕 + 相机），预览已更新"
+        } else if let s = screen {
+            frameStore?.applyGlassesFrames(screen: s, camera: frameStore?.cameraImage)
+            previewNote = "只抓到屏幕画面：\(error ?? "")"
+        } else {
+            previewNote = "刷新失败：\(error ?? "未知")"
+        }
+        previewBusy = false
+        if let error = error {
+            append("刷新预览失败：\(error)")
+            completion(.failure(ADBError.connectionFailed(error)))
+        } else {
+            append(previewNote)
+            completion(.success(previewNote))
+        }
+    }
+
+    /// 复用它已授权的连接；没有就自己连一条（复用 GlassesDiscovery 记住的 IP）。
+    private func clientForPreview(host: String?,
+                                  completion: @escaping (Result<ADBClient, Error>) -> Void) {
+        if let existing = orchestrator.adb {
+            completion(.success(existing))
+            return
+        }
+        if let existing = previewAdb {
+            completion(.success(existing))
+            return
+        }
+        let address = (host?.isEmpty == false ? host : nil)
+            ?? GlassesDiscovery.shared.lastIP
+            ?? ""
+        guard !address.isEmpty else {
+            completion(.failure(ADBError.connectionFailed(
+                "还不知道眼镜 IP：先点「① 自动部署采集端」，或在参数里填眼镜 IP")))
+            return
+        }
+        let client = ADBClient(host: address, port: 5555)
+        client.log = { [weak self] message in self?.append("[预览/ADB] \(message)") }
+        client.connect { [weak self] result in
+            guard let self = self else { return }
+            switch result {
+            case .failure(let error):
+                completion(.failure(error))
+            case .success:
+                GlassesDiscovery.shared.remember(address)
+                self.previewAdb = client
+                self.append("预览连接已建立（\(address)）")
+                completion(.success(client))
+            }
+        }
+    }
+
+    private func grabScreenShot(client: ADBClient,
+                                completion: @escaping (CGImage?, String?) -> Void) {
+        client.shell(CaptureOrchestrator.screenSnapshotCommand(), timeout: 25) { [weak self] result in
+            guard let self = self else { return }
+            let text = (try? result.get())?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let size = Int(text.split(separator: "\n").last.map(String.init) ?? "") ?? 0
+            guard size > 0 else {
+                completion(nil, "screencap 没有产出文件（\(text.isEmpty ? "无输出" : text)）")
+                return
+            }
+            client.pull(path: CaptureOrchestrator.screenSnapshotPath, knownSize: size) { pullResult in
+                switch pullResult {
+                case .success(let data):
+                    completion(UIImage(data: data)?.cgImage, nil)
+                case .failure(let error):
+                    completion(nil, error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    private func grabCameraShot(client: ADBClient,
+                                completion: @escaping (CGImage?, String?) -> Void) {
+        client.shell(CaptureOrchestrator.cameraSnapshotCommand(), timeout: 20) { [weak self] _ in
+            guard let self = self else { return }
+            client.shell(CaptureOrchestrator.waitSnapshotCommand(), timeout: 25) { result in
+                let text = (try? result.get())?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                guard text.contains("READY") else {
+                    completion(nil, "相机快照超时（\(text)）")
+                    return
+                }
+                let size = Self.number(after: "size=", in: text) ?? 0
+                client.pull(path: CaptureOrchestrator.cameraSnapshotPath,
+                            knownSize: size > 0 ? size : nil) { pullResult in
+                    switch pullResult {
+                    case .success(let data):
+                        // 注意：实拍验证过这张 JPEG **不需要**旋转 180°。
+                        // 录像走编码器 Surface，HAL 不做旋转（所以合成时要补 ±180）；
+                        // JPEG 由 HAL 按 sensor 方向输出，已经是正的。
+                        completion(UIImage(data: data)?.cgImage, nil)
+                    case .failure(let error):
+                        completion(nil, error.localizedDescription)
+                    }
+                }
+            }
+        }
     }
 
     // MARK: - 日志
