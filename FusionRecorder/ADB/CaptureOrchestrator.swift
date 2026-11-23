@@ -89,7 +89,12 @@ final class CaptureOrchestrator: ObservableObject {
     /// 屏幕路是 SurfaceControl 虚拟屏镜像，屏一黑就没有任何新帧，
     /// 录出来的 mp4 会几乎全是静止帧（这也是 0.3.x「屏幕冻结」的诱因之一）。
     static func prepareRecordCommand() -> String {
-        "mkdir -p \(cameraMP4Dir); rm -f \(screenStopFlag); "
+        // 必须先把上一次的 mp4 和 .meta 删掉：上传失败时旧文件会留在眼镜上，
+        // 而 .meta 又是「已封口」的判据 —— 万一这次采集端没起来，
+        // 就绪检查会被旧文件骗过，拉回来的是上一条片子。
+        "mkdir -p \(cameraMP4Dir); rm -f \(screenStopFlag) "
+            + "\(screenMP4Path) \(screenMP4Path).meta "
+            + "\(cameraMP4Path) \(cameraMP4Path).meta; "
             + "input keyevent KEYCODE_WAKEUP; "
             + "settings put system screen_off_timeout 1800000; "
             + "svc power stayon true"

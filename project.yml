@@ -44,8 +44,10 @@ settings:
     #                 字节校验只拦「收少了」，收多了（文件封口后又长）按实际算
     #         0.4.8 = 就绪检查改真轮询：0.6 秒一轮最多 18 轮（真机实测最坏 13.4 秒），
     #                 原来只采样一次，相机 drain EOS 慢过 0.5 秒就会立刻判「没写完」
-    MARKETING_VERSION: "0.4.8"
-    CURRENT_PROJECT_VERSION: "19"
+    #         0.4.9 = 录制前删掉上一次的 mp4 和 .meta：上传失败时旧文件会留在眼镜上，
+    #                 而 .meta 是「已封口」判据，旧文件会让就绪检查误判、拉回上一条片子
+    MARKETING_VERSION: "0.4.9"
+    CURRENT_PROJECT_VERSION: "20"
     # 侧载不需要 Apple 签名，签名交给 SideStore / AltStore 用免费 Apple ID 做
     CODE_SIGNING_ALLOWED: "NO"
     CODE_SIGNING_REQUIRED: "NO"
