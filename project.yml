@@ -53,8 +53,12 @@ settings:
     #                 ③ 刷新预览：screencap + APK SNAPSHOT 抓真实两帧再合成
     #         0.5.1 = 真机命令修正：快照改用 start-foreground-service（Android 9 拒绝
     #                 后台服务启动）；设备型号改用两行 echo（竖线被 shell 当管道吃掉）
-    MARKETING_VERSION: "0.5.1"
-    CURRENT_PROJECT_VERSION: "22"
+    #         0.5.2 = 眼镜端音频时基修准：不再拿 startRecording() 当时钟起点（真机实测
+    #                 麦克风要 3.5 秒才吐第一个采样，音轨会整体错位），改用
+    #                 AudioRecord.getTimestamp(TIMEBASE_MONOTONIC) 反推第 0 帧真实时刻；
+    #                 读循环改非阻塞轮询 + 尾部排空加硬上限（原来停止会卡 7 秒）
+    MARKETING_VERSION: "0.5.2"
+    CURRENT_PROJECT_VERSION: "23"
     # 侧载不需要 Apple 签名，签名交给 SideStore / AltStore 用免费 Apple ID 做
     CODE_SIGNING_ALLOWED: "NO"
     CODE_SIGNING_REQUIRED: "NO"

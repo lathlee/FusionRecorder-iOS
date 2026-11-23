@@ -412,27 +412,42 @@ final class OfflineCompositor {
 
         let out = videoURL.deletingLastPathComponent()
             .appendingPathComponent("fusion_mux_\(UUID().uuidString).mp4")
-        let preset = needsGain ? AVAssetExportPresetHighestQuality
-                               : AVAssetExportPresetPassthrough
-        guard let export = AVAssetExportSession(asset: comp, presetName: preset) else {
-            NSLog("[离线合成] 无法创建导出会话（preset=%@）", preset)
-            return nil
-        }
-        export.outputURL = out
-        export.outputFileType = .mp4
-        export.shouldOptimizeForNetworkUse = false
-        if needsGain { export.audioMix = mix }
+        NSLog("[离线合成] 音轨位移 %.0fms，成片 %.2fs / 音轨可用 %.2fs",
+              (shiftUs / 1000), CMTimeGetSeconds(CMTime(value: totalUs, timescale: 1_000_000)),
+              CMTimeGetSeconds(usable))
 
-        let sem = DispatchSemaphore(value: 0)
-        export.exportAsynchronously { sem.signal() }
-        sem.wait()
-        guard export.status == .completed else {
-            NSLog("[离线合成] 音轨合并导出失败: status=%ld %@",
-                  export.status.rawValue,
+        // ★ 0.5.2：Passthrough 导出对「音轨不从 0 开始」的排版不一定成功，
+        //   而真机上眼镜的麦克风要 3.5 秒才起播，位移恒为几秒 —— 这一步失败的代价
+        //   就是整条片子没声音，跟没做这个功能一样。所以先试 passthrough（视频不重编码），
+        //   失败立刻退到最高质量重编一遍。640×480 的素材重编码代价很小。
+        let presets = needsGain
+            ? [AVAssetExportPresetHighestQuality]
+            : [AVAssetExportPresetPassthrough, AVAssetExportPresetHighestQuality]
+
+        for (i, usePreset) in presets.enumerated() {
+            guard let export = AVAssetExportSession(asset: comp, presetName: usePreset) else {
+                NSLog("[离线合成] 无法创建导出会话（preset=%@），换下一个", usePreset)
+                continue
+            }
+            let target = i == 0 ? out
+                : videoURL.deletingLastPathComponent()
+                    .appendingPathComponent("fusion_mux_\(UUID().uuidString).mp4")
+            export.outputURL = target
+            export.outputFileType = .mp4
+            export.shouldOptimizeForNetworkUse = false
+            if needsGain { export.audioMix = mix }
+
+            let sem = DispatchSemaphore(value: 0)
+            export.exportAsynchronously { sem.signal() }
+            sem.wait()
+            if export.status == .completed {
+                NSLog("[离线合成] 音轨已并入（volume=%.2f, preset=%@）", volume, usePreset)
+                return target
+            }
+            NSLog("[离线合成] 音轨合并导出失败（preset=%@）: status=%ld %@",
+                  usePreset, export.status.rawValue,
                   export.error?.localizedDescription ?? "未知")
-            return nil
         }
-        NSLog("[离线合成] 音轨已并入（volume=%.2f, preset=%@）", volume, preset)
-        return out
+        return nil
     }
 }
