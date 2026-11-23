@@ -54,10 +54,6 @@ struct ContentView: View {
 
     // iPhone 端连接（交接包 §5：POC_PC_IP / POC_SCREEN_PORT / POC_CAM_PORT）
     @AppStorage("host") private var host = "192.168.101.133"
-    /// 用户在「连接参数」里手改过眼镜 IP 就锁住：扫描结果不许再覆盖它。
-    /// 真机上出现过「手动改成 192.168.137.158，过一会儿又跳回 172 段」——
-    /// 自动扫描命中了别的地址，把用户填的值冲掉了。
-    @AppStorage("hostManual") private var hostManual = false
     @AppStorage("screenPort") private var screenPort = "9114"
     @AppStorage("cameraPort") private var cameraPort = "9115"
 
@@ -191,6 +187,10 @@ struct ContentView: View {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { refreshLanIP() }
             DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) { refreshLanIP() }
             autoPreviewIfNeeded()
+            // ★ 0.6.0：监听网络路径变化。换 WiFi / 切热点 / 换网段都算，
+            // 一变就自动重扫 —— 以前**没有任何东西**会自动发起扫描，
+            // 只能靠用户点按钮，所以「iPhone 和眼镜换了网段」时界面一直挂着旧 IP。
+            GlassesDiscovery.shared.startPathMonitor { onNetworkChanged() }
         }
         .onChange(of: fusionParams) { newValue in
             session.update(params: newValue)
@@ -200,12 +200,18 @@ struct ContentView: View {
                 GlassesDiscovery.shared.requestLocalNetworkPermission()
                 refreshLanIP()
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { refreshLanIP() }
+                // 回到前台且还没连上：顺手扫一次，别让用户自己记得点按钮
+                if !orchestrator.isConnected && !session.isRunning { autoScan() }
             }
         }
         .onChange(of: orchestrator.glassesIP) { newValue in
-            // 只有用户没手填过，才允许把扫描到的地址写回输入框。
-            // 手填过就锁住 —— 否则「手动改了也会跳回去」。
-            if !hostManual, let ip = newValue, !ip.isEmpty, ip != host { host = ip }
+            // ★ 0.6.0：这里是「已验证地址」——编排器只在 ADB 握手成功后才写它。
+            // 所以它永远优先于手填值：直接回写输入框并解锁。
+            // 之前的规则是「手填过就不许覆盖」，结果换了网段之后界面一直挂着旧 IP，
+            // 而实际连接用的又是新地址，看起来就是「固定在旧 IP、不会动态扫描」。
+            if let ip = newValue, !ip.isEmpty, ip != host {
+                host = ip
+            }
             refreshLanIP()
         }
         // 掉线：清预览 + 让界面马上改成「已断开」，不等人去点任何按钮
@@ -810,24 +816,24 @@ struct ContentView: View {
             // ---- 连接参数 ----
             blockCard("连接参数", icon: "network") {
                 VStack(spacing: 9) {
-                    Text("眼镜无线 ADB 默认 5555。手改过的 IP 会被锁住，自动扫描不会覆盖它。")
+                    Text("眼镜 IP 会自动扫描并自动记住；只有扫描不到时才需要手填。"
+                        + "换 WiFi / 切热点后网段一变，会自动重新扫描。")
                         .font(.system(size: 10.5))
                         .foregroundStyle(Palette.hint)
                         .fixedSize(horizontal: false, vertical: true)
-                    fieldRow("眼镜 IP", text: hostBinding, decimal: true)
+                    fieldRow("眼镜 IP", text: $host, decimal: true)
                     HStack(spacing: 8) {
                         Button("恢复自动") {
-                            hostManual = false
                             host = orchestrator.glassesIP ?? Self.defaultHost
-                            session.appendUser("眼镜 IP 改回自动（当前 \(host)）")
+                            session.appendUser("眼镜 IP 交回自动（当前 \(host)）")
                         }
                         .font(.system(size: 11.5, weight: .medium))
                         .foregroundStyle(Palette.accent)
                         .buttonStyle(.plain)
                         Spacer()
-                        Text(hostManual ? "已锁定（手动）" : "自动")
-                            .font(.system(size: 10.5, weight: .medium))
-                            .foregroundStyle(hostManual ? Palette.warn : Palette.hint)
+                        Text("已连接 \(orchestrator.glassesIP ?? "—")")
+                            .font(.system(size: 10.5, design: .monospaced))
+                            .foregroundStyle(Palette.hint)
                     }
                     fieldRow("屏幕流端口", text: $screenPort, decimal: false)
                     fieldRow("相机流端口", text: $cameraPort, decimal: false)
@@ -928,19 +934,6 @@ struct ContentView: View {
         .frame(height: 42)
         .background(Palette.field)
         .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
-    }
-
-    /// 手改即锁定：只有经过这个 Binding 的写入才算「用户改的」，
-    /// 代码里直接 `host = ip` 不经过它，所以自动扫描不会把锁打开。
-    private var hostBinding: Binding<String> {
-        Binding(
-            get: { host },
-            set: { newValue in
-                host = newValue
-                let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
-                hostManual = Self.isIPv4(trimmed)     // 输入中间态（如 "192.168.1"）先不锁
-            }
-        )
     }
 
     static func isIPv4(_ text: String) -> Bool {
@@ -1097,10 +1090,7 @@ struct ContentView: View {
     }
 
     private func autoScan() {
-        guard !autoBusy else {
-            session.appendUser("部署流程还在执行中，请稍等")
-            return
-        }
+        guard !autoBusy, !orchestrator.isBusy else { return }
         autoBusy = true
         orchestrator.run(host: nil, iphoneHostIP: nil,
                          extraCandidates: knownCandidates) { [self] result in
@@ -1112,6 +1102,19 @@ struct ContentView: View {
                 }
             }
         }
+    }
+
+    /// 系统网络路径变了（换 WiFi / 切热点 / 换网段）。
+    private func onNetworkChanged() {
+        guard scenePhase == .active else { return }
+        guard !session.isRunning else {
+            session.appendUser("网络变了，但正在录制：停止后点「重新扫描」即可跟上新 IP")
+            return
+        }
+        guard !orchestrator.isBusy, !autoBusy else { return }
+        session.appendUser("检测到网络变化，自动重新扫描眼镜…")
+        refreshLanIP()
+        autoScan()
     }
 
     private func autoRecord() {

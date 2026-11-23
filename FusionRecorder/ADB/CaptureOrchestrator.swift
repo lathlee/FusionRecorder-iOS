@@ -303,6 +303,16 @@ final class CaptureOrchestrator: ObservableObject {
         // 这一行能直接看出是只有 VPN 接口、还是根本没接口。
         append("本机接口：\(GlassesDiscovery.shared.interfaceDump)")
 
+        // 扫不到眼镜时最常见的两种原因，这里直接写清楚：
+        // 「一个本机地址都没有」= 没法拼 /24，只能靠已知 IP。
+        let localSubnets = GlassesDiscovery.shared.localIPv4()
+            .filter(GlassesDiscovery.isPrivateIPv4)
+        if localSubnets.isEmpty {
+            append("⚠︎ 读不到任何本机局域网地址：无法扫网段，只能探已知 IP")
+        } else {
+            append("可扫网段：\(localSubnets.joined(separator: " / "))")
+        }
+
         // 主动碰一次局域网，把 iOS「本地网络」权限框逼出来（详见 GlassesDiscovery）。
         GlassesDiscovery.shared.requestLocalNetworkPermission()
 

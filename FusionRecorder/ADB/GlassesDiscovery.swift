@@ -49,8 +49,18 @@ final class GlassesDiscovery {
         defaults.removeObject(forKey: lastIPKey)
     }
 
-    /// 本机 IPv4（去掉 loopback）。iPhone 开热点时通常是 172.20.10.1。
+    /// 本机 IPv4（去掉 loopback）。
+    /// 先走 `getifaddrs`（能给出每个接口），再补一个「默认路由源地址」——
+    /// iOS 上 getifaddrs 有时看不到 Wi-Fi 接口，只有 VPN 的 utun。
     func localIPv4() -> [String] {
+        var result = interfaceIPv4()
+        if let outbound = outboundIPv4(), !result.contains(outbound) {
+            result.append(outbound)
+        }
+        return result
+    }
+
+    private func interfaceIPv4() -> [String] {
         var result: [String] = []
         var addresses: UnsafeMutablePointer<ifaddrs>?
         guard getifaddrs(&addresses) == 0, let first = addresses else { return result }
@@ -174,7 +184,12 @@ final class GlassesDiscovery {
     /// 真机踩过：界面上「本机 IP 未获取到」，但日志里能看到到底有哪些接口、
     /// 是不是只有 VPN 的 16.x，一眼就能判断问题在哪。
     func interfaceDump() -> String {
-        let all = localIPv4Named()
+        var all = localIPv4Named()
+        // 把「默认路由源地址」也列出来：getifaddrs 看不到 Wi-Fi 时，
+        // 这一项往往才是真正能用的那个地址。
+        if let outbound = outboundIPv4(), !all.contains(where: { $0.ip == outbound }) {
+            all.append((name: "route", ip: outbound))
+        }
         if all.isEmpty { return "无 IPv4 接口（连 127.0.0.1 都没有，异常）" }
         return all.map { item -> String in
             // 别在插值里嵌三元字符串：`"\(a ? "" : "x")"` 这种写法会把字面量提前截断，
@@ -193,7 +208,84 @@ final class GlassesDiscovery {
         return Self.pickLocalIP(from: all.filter(Self.isPrivateIPv4), glassesIP: glassesIP)
     }
 
-    // MARK: - 主动申请「本地网络」权限
+    // MARK: - 网络变化监听（0.6.0）
+
+    private var pathMonitor: NWPathMonitor?
+    private var lastPathSignature = ""
+    private var pathChangeHandler: (() -> Void)?
+
+    /// 监听系统网络路径变化：换 WiFi、切热点、掉线重连都会触发。
+    ///
+    /// 为什么必须加：以前**没有任何东西会自动发起扫描** —— 只有用户点按钮才会。
+    /// 于是「iPhone 和眼镜同时换了网段」时，界面一直挂着旧 IP，看着就是「不会动态扫描」。
+    /// 现在网段一变就自动重扫一次（1.5 秒防抖，等 DHCP 把地址发下来）。
+    func startPathMonitor(_ handler: @escaping () -> Void) {
+        pathChangeHandler = handler
+        guard pathMonitor == nil else { return }
+        let monitor = NWPathMonitor()
+        pathMonitor = monitor
+        monitor.pathUpdateHandler = { [weak self] path in
+            guard let self = self else { return }
+            let status = (path.status == .satisfied) ? "up" : "down"
+            let names = path.availableInterfaces.map { $0.name }.sorted().joined(separator: ",")
+            let signature = status + "|" + names
+            if self.lastPathSignature.isEmpty {
+                self.lastPathSignature = signature
+                return
+            }
+            guard signature != self.lastPathSignature else { return }
+            self.lastPathSignature = signature
+            NSLog("[Discovery] 网络路径变化：\(signature)")
+            // 防抖：等 DHCP 把新地址发下来再扫
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                self?.pathChangeHandler?()
+            }
+        }
+        monitor.start(queue: DispatchQueue(label: "com.lath.fusionrecorder.path"))
+    }
+
+    /// 默认路由用的那个本机地址（UDP connect 不发包，只让内核选路）。
+    ///
+    /// `getifaddrs` 在 iOS 上有时候拿不到 Wi-Fi 接口的地址（只剩 VPN 的 utun），
+    /// 那就永远拼不出 /24、也就永远发现不了换网段后的眼镜。这个 API 走内核选路，
+    /// 拿到的正是「真正会用来发包」的那个源地址，作为补充。
+    func outboundIPv4() -> String? {
+        let sock = socket(AF_INET, SOCK_DGRAM, 0)
+        guard sock >= 0 else { return nil }
+        defer { close(sock) }
+
+        var target = sockaddr_in()
+        target.sin_family = sa_family_t(AF_INET)
+        target.sin_port = in_port_t(53).bigEndian
+        target.sin_addr.s_addr = inet_addr("8.8.8.8")
+
+        let connected = withUnsafePointer(to: &target) { pointer -> Int32 in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { address in
+                connect(sock, address, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard connected == 0 else { return nil }
+
+        var local = sockaddr_in()
+        var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let named = withUnsafeMutablePointer(to: &local) { pointer -> Int32 in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { address in
+                getsockname(sock, address, &length)
+            }
+        }
+        guard named == 0 else { return nil }
+
+        var buffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+        var sinAddr = local.sin_addr
+        guard inet_ntop(AF_INET, &sinAddr, &buffer, socklen_t(INET_ADDRSTRLEN)) != nil else {
+            return nil
+        }
+        let ip = String(cString: buffer)
+        guard !ip.isEmpty, ip != "0.0.0.0" else { return nil }
+        return ip
+    }
+
+    // MARK: - 「本地网络」权限
 
     private var permissionBrowser: NWBrowser?
     private var broadcastProbe: NWConnection?

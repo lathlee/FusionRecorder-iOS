@@ -123,8 +123,20 @@ settings:
     #                 ⑤ 预览截图前先 KEYCODE_WAKEUP —— 录制那条路本来就有，
     #                    预览没有，眼镜息屏时就「能录制、抓不到预览」；
     #                 ⑥ 预览失败原因改用警告色、可换行，不再和「已抓取」一个灰度。
-    MARKETING_VERSION: "0.5.9"
-    CURRENT_PROJECT_VERSION: "31"
+    #         0.6.0 = 真正的「动态扫描」：
+    #                 ① 以前**没有任何东西会自动发起扫描** —— 只有点按钮才会。
+    #                    现在 NWPathMonitor 监听网络路径变化（换 WiFi / 切热点 /
+    #                    换网段），一变就防抖 1.5 秒自动重扫；回到前台也会扫一次。
+    #                 ② 0.5.9 的「手填锁定」反而把界面锁死在旧 IP 上。现在反过来：
+    #                    只有 ADB 握手验证过的地址才会回写输入框（已验证的永远优先），
+    #                    手填值在下一次验证成功时自然被替换，不再需要锁。
+    #                 ③ 本机 IP 增加「默认路由源地址」兜底（UDP connect + getsockname）：
+    #                    iOS 上 getifaddrs 有时看不到 Wi-Fi 接口，那样永远拼不出 /24，
+    #                    也就永远发现不了换网段后的眼镜。
+    #                 ④ 部署日志新增「可扫网段 / 读不到任何本机局域网地址」一行，
+    #                    一扫不到就能判断是权限/接口问题还是眼镜侧问题。
+    MARKETING_VERSION: "0.6.0"
+    CURRENT_PROJECT_VERSION: "32"
     # 侧载不需要 Apple 签名，签名交给 SideStore / AltStore 用免费 Apple ID 做
     CODE_SIGNING_ALLOWED: "NO"
     CODE_SIGNING_REQUIRED: "NO"
