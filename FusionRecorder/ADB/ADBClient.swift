@@ -40,7 +40,15 @@ final class ADBClient {
         var onOpened: ((UInt32) -> Void)?
         var onData: ((UInt32, Data) -> Void)?
         var onClose: ((UInt32, Data) -> Void)?
-        var timer: DispatchSourceTimer?
+        var onTimeout: (() -> Void)?
+        /// 空闲超时（秒）。0 = 不限时。
+        ///
+        /// 为什么不用「一次性 timer + 每块数据重排」：真机上那套不可靠 ——
+        /// 14MB 的相机 mp4 要在 0.19MB/s 的链路上传 70 秒，实测就是被 45 秒的
+        /// 超时误杀了。改成「记最后活动时间 + 一个统一的重复看门狗」，
+        /// 只要数据还在流就永远不会超时，链路真的断了才会触发。
+        var idleTimeout: TimeInterval = 0
+        var lastActivityAt = Date()
         init(_ service: String) { self.service = service }
     }
 
@@ -53,6 +61,8 @@ final class ADBClient {
     private var nextLocalId: UInt32 = 0x10000001
     private var authRound = 0
     private let finishLock = NSLock()
+    /// 统一空闲看门狗（2 秒一格），见 Stream.idleTimeout
+    private var watchdog: DispatchSourceTimer?
 
     init(host: String, port: UInt16 = 5555) {
         let nwPort = NWEndpoint.Port(rawValue: port) ?? NWEndpoint.Port(rawValue: 5555)!
@@ -175,10 +185,10 @@ final class ADBClient {
     // MARK: - sync pull（0.4.0 离线录制：拉回眼镜本地的两个 mp4）
 
     /// 从设备拉取一个文件的完整字节。progress 回调已切到主线程，0...1。
-    /// 拉取远端文件。timeout 是「空闲超时」：每收到一块数据就重新计时，
-    /// 所以真正限制的是「链路卡死多久算失败」，而不是总时长。
-    /// 眼镜实测无线 ADB 只有 0.2~0.5MB/s，1 分钟录制约 12MB，硬性总超时会误杀。
-    func pull(path: String, knownSize: Int? = nil, timeout: TimeInterval = 45,
+    /// timeout 是**空闲**超时（60 秒没收到任何数据才算断），不是总时长。
+    /// 实测这条链路只有 0.19~0.28MB/s，60 秒录制要传 14MB ≈ 70 秒，
+    /// 用总时长做超时必然误杀。
+    func pull(path: String, knownSize: Int? = nil, timeout: TimeInterval = 60,
               progress: ((Double) -> Void)? = nil,
               completion: @escaping (Result<Data, Error>) -> Void) {
         let request = ADBSyncPuller.recvFrame(path: path)
@@ -197,6 +207,9 @@ final class ADBClient {
         // 所以进度条必须靠调用方先 stat 出的文件大小来算，否则永远 0%。
         var expectedSize: Int? = knownSize
         pullBuffer.removeAll(keepingCapacity: false)
+        // 传输速率日志：链路上限只有 0.2MB/s，必须能一眼看出「在动」还是「卡死」
+        let startedAt = Date()
+        var lastLoggedMB = 0
 
         open(service: "sync:", timeout: timeout,
              onOpened: { [weak self] localId in
@@ -205,7 +218,8 @@ final class ADBClient {
              },
              onData: { [weak self] localId, chunk in
                  guard let self = self else { return }
-                 self.bumpTimeout(localId, timeout: timeout)
+                 // 收到数据就刷新活动时间，看门狗据此判断链路是否还活着
+                 self.streams[localId]?.lastActivityAt = Date()
                  self.pullBuffer.append(chunk)
                  let parsed = ADBSyncPuller.parseResponses(self.pullBuffer)
                  if parsed.consumed > 0 {
@@ -222,14 +236,27 @@ final class ADBClient {
                          if fileData.isEmpty {
                              finish(.failure(ADBSyncPullError.emptyFile(path)))
                          } else {
+                             let secs = max(0.001, Date().timeIntervalSince(startedAt))
+                             let rate = Double(fileData.count) / 1048576.0 / secs
+                             self.log?(String(format: "pull 完成：%@ %.2fMB 用时 %.0fs（%.2fMB/s）",
+                                              path, Double(fileData.count) / 1048576.0, secs, rate))
                              finish(.success(fileData))
-                             log?("pull 完成：\(path) \(fileData.count) 字节")
                          }
                          self.closeStream(localId)
                      case .failed(let message):
                          finish(.failure(ADBSyncPullError.rejected(message)))
                          self.closeStream(localId)
                      }
+                 }
+                 // 每涨 1MB 打一行，卡住的时候一眼能看出来停在哪
+                 let mb = fileData.count / 1048576
+                 if mb > lastLoggedMB {
+                     lastLoggedMB = mb
+                     let secs = max(0.001, Date().timeIntervalSince(startedAt))
+                     let rate = Double(fileData.count) / 1048576.0 / secs
+                     let total = expectedSize.map { String(format: "/%.1fMB", Double($0) / 1048576.0) } ?? ""
+                     self.log?(String(format: "pull %@ %dMB%@  平均 %.2fMB/s",
+                                      (path as NSString).lastPathComponent, mb, total, rate))
                  }
                  if let total = expectedSize, total > 0 {
                      let ratio = min(1.0, Double(fileData.count) / Double(total))
@@ -259,20 +286,11 @@ final class ADBClient {
         stream.onOpened = onOpened
         stream.onData = onData
         stream.onClose = onClose
+        stream.onTimeout = onTimeout
+        stream.idleTimeout = timeout
+        stream.lastActivityAt = Date()
         streams[localId] = stream
-
-        if timeout > 0 {
-            let timer = DispatchSource.makeTimerSource(queue: queue)
-            timer.schedule(deadline: .now() + timeout)
-            timer.setEventHandler { [weak self] in
-                guard let self = self, let stream = self.streams[localId] else { return }
-                self.streams.removeValue(forKey: localId)
-                stream.timer?.cancel()
-                onTimeout?()
-            }
-            timer.resume()
-            stream.timer = timer
-        }
+        ensureWatchdog()
 
         var payload = Data(service.utf8)
         payload.append(0)
@@ -280,10 +298,28 @@ final class ADBClient {
         return localId
     }
 
-    /// 把流的超时往后推（幂等）：有大块数据在流动就说明链路还活着。
-    private func bumpTimeout(_ localId: UInt32, timeout: TimeInterval) {
-        guard timeout > 0, let stream = streams[localId], let timer = stream.timer else { return }
-        timer.schedule(deadline: .now() + timeout)
+    /// 统一的空闲看门狗：每 2 秒扫一遍所有流，只有「超过 idleTimeout 没有收到任何数据」
+    /// 才算超时。数据一直流就永远不会超时 —— 大文件在慢链路上也能传完。
+    private func ensureWatchdog() {
+        if watchdog != nil { return }
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + 2, repeating: 2.0)
+        timer.setEventHandler { [weak self] in
+            guard let self = self else { return }
+            let now = Date()
+            for (localId, stream) in self.streams {
+                guard stream.idleTimeout > 0 else { continue }
+                let idle = now.timeIntervalSince(stream.lastActivityAt)
+                guard idle >= stream.idleTimeout else { continue }
+                self.streams.removeValue(forKey: localId)
+                let remoteId = stream.remoteId ?? 0
+                self.send(ADBPacket(command: ADBPacket.CLSE, arg0: localId, arg1: remoteId))
+                self.log?("stream \(localId) 空闲 \(Int(idle))s 超时（\(stream.service)）")
+                stream.onTimeout?()
+            }
+        }
+        timer.resume()
+        watchdog = timer
     }
 
     private func write(_ localId: UInt32, _ payload: Data) {
@@ -293,7 +329,6 @@ final class ADBClient {
 
     private func closeStream(_ localId: UInt32) {
         guard let stream = streams.removeValue(forKey: localId) else { return }
-        stream.timer?.cancel()
         let remoteId = stream.remoteId ?? 0
         send(ADBPacket(command: ADBPacket.CLSE, arg0: localId, arg1: remoteId))
     }
@@ -368,6 +403,7 @@ final class ADBClient {
         case ADBPacket.WRTE:
             let localId = packet.arg1
             if let stream = streams[localId] {
+                stream.lastActivityAt = Date()
                 stream.received.append(packet.payload)
                 stream.onData?(localId, packet.payload)
             }
@@ -376,7 +412,6 @@ final class ADBClient {
         case ADBPacket.CLSE:
             let localId = packet.arg1
             if let stream = streams.removeValue(forKey: localId) {
-                stream.timer?.cancel()
                 send(ADBPacket(command: ADBPacket.CLSE, arg0: localId, arg1: stream.remoteId ?? 0))
                 stream.onClose?(localId, stream.received)
             }

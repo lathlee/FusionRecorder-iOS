@@ -80,6 +80,7 @@ final class RecorderSession: ObservableObject {
     /// 远端两个 mp4 的字节数（来自 stat），用于拉取进度条
     private var pullScreenTotal: Int?
     private var pullCameraTotal: Int?
+    private var pullStartDate: Date?
 
     /// 抓帧用的旧解码器（参数预览/调试用；离线录制路径不调用）
     private var captureScreenReceiver: H264StreamReceiver?
@@ -306,41 +307,24 @@ final class RecorderSession: ObservableObject {
             fail("本地路径未初始化")
             return
         }
-        setPhase(.pulling, "传输屏幕 mp4（0%）…")
+        pullStartDate = Date()
+        setPhase(.pulling, "传输屏幕 mp4…")
 
-        adb.pull(path: screenRemotePath, knownSize: pullScreenTotal,
-                 progress: { [weak self] ratio in
+        // 小文件先传，大文件后传：任一路失败时重试成本最低
+        pullOne(adb: adb, path: screenRemotePath, dest: screenURL,
+                total: pullScreenTotal, label: "屏幕", isScreen: true) { [weak self] screenError in
             guard let self = self else { return }
-            self.pullScreenProgress = ratio
-            self.updatePullProgress()
-        }) { [weak self] result in
-            guard let self = self else { return }
-            switch result {
-            case .failure(let error):
+            if let error = screenError {
                 self.fail("拉取屏幕 mp4 失败：\(error.localizedDescription)")
                 return
-            case .success(let data):
-                do { try data.write(to: screenURL) }
-                catch { self.fail("保存屏幕 mp4 失败：\(error.localizedDescription)"); return }
-                self.append("屏幕 mp4 已拉取（\(data.count) 字节）")
             }
+            DispatchQueue.main.async { self.phaseDetail = "传输相机 mp4…" }
 
-            DispatchQueue.main.async { self.phaseDetail = "传输相机 mp4（0%）…" }
-            adb.pull(path: cameraRemotePath, knownSize: pullCameraTotal,
-                     progress: { [weak self] ratio in
-                guard let self = self else { return }
-                self.pullCameraProgress = ratio
-                self.updatePullProgress()
-            }) { [weak self] cameraResult in
-                guard let self = self else { return }
-                switch cameraResult {
-                case .failure(let error):
+            self.pullOne(adb: adb, path: self.cameraRemotePath, dest: cameraURL,
+                         total: self.pullCameraTotal, label: "相机", isScreen: false) { cameraError in
+                if let error = cameraError {
                     self.fail("拉取相机 mp4 失败：\(error.localizedDescription)")
                     return
-                case .success(let data):
-                    do { try data.write(to: cameraURL) }
-                    catch { self.fail("保存相机 mp4 失败：\(error.localizedDescription)"); return }
-                    self.append("相机 mp4 已拉取（\(data.count) 字节）")
                 }
                 // 先读眼镜写下的绝对时间信息（首帧 pts + 真实结束时刻）
                 self.readTrackMetas(adb: adb) { screenMeta, cameraMeta in
@@ -350,6 +334,61 @@ final class RecorderSession: ObservableObject {
                     self.composeOffline(screenURL: screenURL, cameraURL: cameraURL,
                                         outputURL: outputURL,
                                         screenMeta: screenMeta, cameraMeta: cameraMeta)
+                }
+            }
+        }
+    }
+
+    /// 拉一个文件，失败自动重试（最多 3 次）。
+    /// 这条链路只有 0.19~0.28MB/s，60 秒录制要传 14MB，一次失败就整条重来太浪费。
+    private func pullOne(adb: ADBClient, path: String, dest: URL, total: Int?,
+                         label: String, isScreen: Bool, attempt: Int = 0,
+                         completion: @escaping (Error?) -> Void) {
+        adb.pull(path: path, knownSize: total, progress: { [weak self] ratio in
+            guard let self = self else { return }
+            if isScreen { self.pullScreenProgress = ratio } else { self.pullCameraProgress = ratio }
+            self.updatePullProgress()
+        }) { [weak self] result in
+            guard let self = self else { return }
+            switch result {
+            case .success(let data):
+                // 落地前先对字节数：链路这么慢，传到一半断掉但恰好收到 OKAY 的情况
+                // 虽然少见，但一旦发生，后面合成会报「没有视频轨」之类的怪错。
+                if let expected = total, expected > 0, data.count != expected {
+                    if attempt < 2 {
+                        self.append("\(label) mp4 字节数不符（\(data.count)/\(expected)），重试…")
+                        if isScreen { self.pullScreenProgress = 0 } else { self.pullCameraProgress = 0 }
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                            self.pullOne(adb: adb, path: path, dest: dest, total: total,
+                                         label: label, isScreen: isScreen,
+                                         attempt: attempt + 1, completion: completion)
+                        }
+                        return
+                    }
+                    completion(ADBSyncPullError.rejected("字节数不符 \(data.count)/\(expected)"))
+                    return
+                }
+                do {
+                    try data.write(to: dest)
+                    self.append("\(label) mp4 已拉取（\(data.count) 字节）")
+                    if isScreen { self.pullScreenProgress = 1 } else { self.pullCameraProgress = 1 }
+                    self.updatePullProgress()
+                    completion(nil)
+                } catch {
+                    completion(error)
+                }
+            case .failure(let error):
+                if attempt < 2 {
+                    self.append("\(label) 第 \(attempt + 1) 次拉取失败：\(error.localizedDescription)，"
+                                + "3 秒后重试（\(attempt + 2)/3）…")
+                    if isScreen { self.pullScreenProgress = 0 } else { self.pullCameraProgress = 0 }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                        self.pullOne(adb: adb, path: path, dest: dest, total: total,
+                                     label: label, isScreen: isScreen,
+                                     attempt: attempt + 1, completion: completion)
+                    }
+                } else {
+                    completion(error)
                 }
             }
         }
@@ -390,7 +429,22 @@ final class RecorderSession: ObservableObject {
     private func updatePullProgress() {
         let ratio = min(1.0, (pullScreenProgress + pullCameraProgress) / 2.0)
         offlineProgress = ratio
-        phaseDetail = String(format: "传输 mp4（%.0f%%）…", ratio * 100)
+        var text = String(format: "传输 mp4（%.0f%%）", ratio * 100)
+        // 这条链路只有 0.2MB/s 左右，必须把「多少 MB、多快、还要多久」摆出来，
+        // 否则用户看到进度条几乎不动会以为卡死了。
+        if let s = pullScreenTotal, let c = pullCameraTotal, s + c > 0 {
+            let got = Double(s) * pullScreenProgress + Double(c) * pullCameraProgress
+            text += String(format: "  %.1f/%.1fMB", got / 1048576.0, Double(s + c) / 1048576.0)
+            if let start = pullStartDate {
+                let secs = Date().timeIntervalSince(start)
+                if secs > 1, got > 0 {
+                    let rate = got / secs
+                    let remain = (Double(s + c) - got) / rate
+                    text += String(format: "  %.2fMB/s  剩约 %.0fs", rate / 1048576.0, max(0, remain))
+                }
+            }
+        }
+        phaseDetail = text + "…"
     }
 
     private func composeOffline(screenURL: URL, cameraURL: URL, outputURL: URL,

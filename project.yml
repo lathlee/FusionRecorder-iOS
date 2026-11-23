@@ -37,8 +37,10 @@ settings:
     #         push 后校验远端字节数 / pm install 失败判定补 Exception / 所有静默 return 都打日志
     # 0.4.4 = 根治「部署成功但没装上」：sync SEND 的 mode 必须是十进制 st_mode（33188），
     #         写八进制 "644" 会被 adbd 当成十进制 → 0o1204（--w----r-T）→ pm install 读不了
-    MARKETING_VERSION: "0.4.4"
-    CURRENT_PROJECT_VERSION: "15"
+    # 0.4.5 = 修「拉相机 mp4 超时」：超时改统一空闲看门狗（数据在流就永不超时）/
+    #         单路失败自动重试 3 次 / 字节数校验 / 进度条带 MB·速率·剩余秒数
+    MARKETING_VERSION: "0.4.5"
+    CURRENT_PROJECT_VERSION: "16"
     # 侧载不需要 Apple 签名，签名交给 SideStore / AltStore 用免费 Apple ID 做
     CODE_SIGNING_ALLOWED: "NO"
     CODE_SIGNING_REQUIRED: "NO"
