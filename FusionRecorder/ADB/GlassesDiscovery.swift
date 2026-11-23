@@ -352,33 +352,52 @@ final class GlassesDiscovery {
     /// 也就永远不去连局域网 IP，系统于是永远不弹权限框 —— 死循环。
     /// 用已知 IP 硬探一次，把这个环打断。
     func candidateIPs(extra: [String] = []) -> [String] {
-        var ordered: [String] = []
+        let locals = localIPv4()
+        let localSubnets = Set(locals.filter(Self.isPrivateIPv4).map { Self.subnetPrefix($0) })
+
+        var known: [String] = []
         for ip in extra where !ip.isEmpty {
+            if !known.contains(ip) { known.append(ip) }
+        }
+        if let last = lastIP, !known.contains(last) { known.append(last) }
+
+        var ordered: [String] = []
+        func add(_ ip: String) {
             if !ordered.contains(ip) { ordered.append(ip) }
         }
-        if let last = lastIP, !ordered.contains(last) { ordered.append(last) }
-        // iOS 热点的网段固定是 172.20.10.0/28（可用 .1~.14）。
-        //
-        // ★ 0.5.9：**只有本机真的在热点网段上**（或上次就成功连过 172.20.10.x）才探这一段。
-        // 0.5.7 是无条件探的，结果普通 WiFi 下也去连 172.20.10.x，
-        // 扫到就把眼镜 IP 改成 172 段 —— 用户看到的「老是自动跳回 172」就是这么来的。
-        let hotspotContext = localIPv4().contains { $0.hasPrefix("172.20.10.") }
+
+        // ① 和本机同网段的已知地址先探：换网络后这才是唯一有希望的
+        for ip in known where localSubnets.contains(Self.subnetPrefix(ip)) { add(ip) }
+
+        // ② iOS 热点的网段固定是 172.20.10.0/28（可用 .1~.14）。
+        //    只有本机真在热点网段上（或上次就连的热点）才探 —— 0.5.7 无条件探，
+        //    结果普通 WiFi 下也去连 172 段、把眼镜 IP 改成 172 段。
+        let hotspotContext = locals.contains { $0.hasPrefix("172.20.10.") }
             || (lastIP?.hasPrefix("172.20.10.") ?? false)
         if hotspotContext {
-            for host in 2...14 {
-                let ip = "172.20.10.\(host)"
-                if !ordered.contains(ip) { ordered.append(ip) }
-            }
+            for host in 2...14 { add("172.20.10.\(host)") }
         }
-        for local in localIPv4() {
+
+        // ③ 本机每个局域网的 /24 全扫（这是「动态发现新网段」的主力）
+        for local in locals where Self.isPrivateIPv4(local) {
             let parts = local.split(separator: ".").compactMap { Int($0) }
             guard parts.count == 4 else { continue }
             for host in 1...254 where host != parts[3] {
-                let ip = "\(parts[0]).\(parts[1]).\(parts[2]).\(host)"
-                if !ordered.contains(ip) { ordered.append(ip) }
+                add("\(parts[0]).\(parts[1]).\(parts[2]).\(host)")
             }
         }
+
+        // ④ 不同网段的旧地址垫在最后：换了网络它们基本是死的，
+        //    但万一眼镜挂在 VPN 后面还是唯一线索，所以不丢、只是排后面。
+        for ip in known where !localSubnets.contains(Self.subnetPrefix(ip)) { add(ip) }
+
         return ordered
+    }
+
+    static func subnetPrefix(_ ip: String) -> String {
+        let parts = ip.split(separator: ".").compactMap { Int($0) }
+        guard parts.count == 4 else { return "" }
+        return "\(parts[0]).\(parts[1]).\(parts[2])"
     }
 
     /// 并发探测 5555 是否可达；命中第一个即回调（不等待全表扫完）。
@@ -388,69 +407,100 @@ final class GlassesDiscovery {
     func scan(extra: [String] = [],
               progress: ((Int, Int) -> Void)? = nil,
               completion: @escaping (DiscoveryResult?) -> Void) {
-        let candidates = candidateIPs(extra: extra)
-        guard !candidates.isEmpty else {
-            completion(nil)
-            return
-        }
+        // ★ 0.6.1：整段扫描搬到后台线程再做（下面有 semaphore.wait，绝不能占主线程）。
+        DispatchQueue.global(qos: .userInitiated).async {
+            let candidates = self.candidateIPs(extra: extra)
+            guard !candidates.isEmpty else {
+                DispatchQueue.main.async { completion(nil) }
+                return
+            }
 
-        let lock = NSLock()
-        var finished = false
-        var probed = 0
-        let total = candidates.count
-        let pool = DispatchQueue(label: "com.lath.fusionrecorder.discovery", attributes: .concurrent)
-        let group = DispatchGroup()
+            let lock = NSLock()
+            var finished = false
+            var probed = 0
+            let total = candidates.count
+            let pool = DispatchQueue(label: "com.lath.fusionrecorder.discovery",
+                                     attributes: .concurrent)
+            let group = DispatchGroup()
+            // 并发闸门：一次只放 64 条在飞。
+            // 以前是 254 条 NWConnection 同时开，真机上直接把连接资源打满，
+            // 大量连接在 .waiting/.failed 之间闪断 —— 整个 /24 扫过去一个都不命中。
+            let gate = DispatchSemaphore(value: 64)
+            let locals = Set(self.localIPv4().filter(Self.isPrivateIPv4)
+                                .map(Self.subnetPrefix))
 
-        for ip in candidates {
-            group.enter()
-            pool.async {
-                defer { group.leave() }
-                // ★ 0.5.8：已知地址给更长的超时。
-                // 真机上出现过「预览能连上这个 IP，扫描却一个都没命中」——
-                // 0.45 秒对一次要走 VPN/隧道的 TCP 握手指令来说太紧了。
-                let known = (ip == self.lastIP) || extra.contains(ip)
-                let reachable = self.probe(ip: ip, port: self.adbPort,
-                                           timeout: known ? 1.5 : 0.6)
-                lock.lock()
-                probed += 1
-                let done = finished
-                if reachable && !finished { finished = true }
-                let current = probed
-                lock.unlock()
-                progress?(current, total)
-                if reachable && !done {
-                    let source = (ip == self.lastIP) ? "上次连接" : "网段扫描"
-                    DispatchQueue.main.async { completion(DiscoveryResult(ip: ip, source: source)) }
+            for ip in candidates {
+                gate.wait()
+                group.enter()
+                pool.async {
+                    defer { gate.signal(); group.leave() }
+                    // 已知地址 / 不在本机网段（可能走 VPN）的地址给更长的超时
+                    let isLocal = locals.contains(Self.subnetPrefix(ip))
+                    let known = (ip == self.lastIP) || extra.contains(ip) || !isLocal
+                    let reachable = self.probeTCP(ip, port: self.adbPort,
+                                                  timeout: known ? 1.2 : 0.7)
+                    lock.lock()
+                    probed += 1
+                    let done = finished
+                    if reachable && !finished { finished = true }
+                    let current = probed
+                    lock.unlock()
+                    progress?(current, total)
+                    if reachable && !done {
+                        let source = (ip == self.lastIP) ? "上次连接" : "网段扫描"
+                        DispatchQueue.main.async {
+                            completion(DiscoveryResult(ip: ip, source: source))
+                        }
+                    }
                 }
             }
-        }
-        group.notify(queue: .main) {
-            lock.lock()
-            let found = finished
-            lock.unlock()
-            if !found { completion(nil) }
+            group.notify(queue: .main) {
+                lock.lock()
+                let found = finished
+                lock.unlock()
+                if !found { completion(nil) }
+            }
         }
     }
 
-    private func probe(ip: String, port: UInt16, timeout: TimeInterval) -> Bool {
-        guard let nwPort = NWEndpoint.Port(rawValue: port) else { return false }
-        let connection = NWConnection(host: NWEndpoint.Host(ip), port: nwPort, using: .tcp)
-        let semaphore = DispatchSemaphore(value: 0)
-        var reached = false
-        connection.stateUpdateHandler = { state in
-            switch state {
-            case .ready:
-                reached = true
-                semaphore.signal()
-            case .failed, .cancelled:
-                semaphore.signal()
-            default:
-                break
+    /// 单地址 TCP 可达性 —— 用原始 socket，不用 `NWConnection`。
+    ///
+    /// 为什么换掉：`NWConnection` 每次都要走 Network.framework 的完整状态机，
+    /// 一次开两三百条会把 iOS 的连接资源打满，大量连接在 `.waiting`/`.failed`
+    /// 之间闪断。真机表现就是「整个网段扫过去一个都没命中，但手工连同一个地址却是通的」。
+    /// 原始 socket 的代价小得多：非阻塞 connect + poll，一条 fd 就是一个整数。
+    func probeTCP(_ ip: String, port: UInt16, timeout: TimeInterval) -> Bool {
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else { return false }
+        defer { close(fd) }
+
+        let flags = fcntl(fd, F_GETFL, 0)
+        guard flags >= 0, fcntl(fd, F_SETFL, flags | O_NONBLOCK) >= 0 else { return false }
+
+        var address = sockaddr_in()
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = port.bigEndian
+        address.sin_addr.s_addr = inet_addr(ip)
+
+        let result = withUnsafePointer(to: &address) { pointer -> Int32 in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
+                // 用 Darwin 限定，避免和同名的实例方法混淆
+                Darwin.connect(fd, sockaddrPointer,
+                               socklen_t(MemoryLayout<sockaddr_in>.size))
             }
         }
-        connection.start(queue: DispatchQueue.global())
-        let result = semaphore.wait(timeout: .now() + timeout)
-        connection.cancel()
-        return result == .success && reached
+        if result == 0 { return true }          // 立即成功（本机地址）
+        guard errno == EINPROGRESS else { return false }
+
+        var descriptor = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
+        let ready = poll(&descriptor, 1, Int32(max(0.05, timeout) * 1000))
+        guard ready > 0 else { return false }
+
+        var socketError: Int32 = 0
+        var length = socklen_t(MemoryLayout<Int32>.size)
+        guard getsockopt(fd, SOL_SOCKET, SO_ERROR, &socketError, &length) == 0 else {
+            return false
+        }
+        return socketError == 0
     }
 }

@@ -128,7 +128,11 @@ struct ContentView: View {
     }
 
     private var connectionIP: String {
-        orchestrator.glassesIP ?? (host.isEmpty ? "—" : host)
+        // ★ 0.6.1：只显示**已经握手验证过**的地址。
+        // 以前回落到 AppStorage 里的手填值，换了网段之后卡片上还挂着旧 IP，
+        // 看着就像「眼镜 IP 是 192.168.101.133」，实际根本没连上。
+        if let ip = orchestrator.glassesIP, !ip.isEmpty { return ip }
+        return "—"
     }
 
     /// 只显示设备自报的型号；没读到就说没读到，不编名字。

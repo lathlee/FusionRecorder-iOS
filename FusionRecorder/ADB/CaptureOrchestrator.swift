@@ -331,24 +331,32 @@ final class CaptureOrchestrator: ObservableObject {
             GlassesDiscovery.shared.scan(extra: extras) { [weak self] result in
                 guard let self = self else { return }
                 guard let found = result else {
-                    // ★ 0.5.8 兜底：端口探测只是「能不能连上 5555」的快速判断，
+                    // ★ 0.6.1 兜底：端口探测只是「能不能连上 5555」的快速判断，
                     // 它失败不代表 ADB 不通（真机上出现过预览能连、扫描却全空）。
-                    // 有记忆地址就直接走一次真实握手，让错误信息变成真正的原因。
+                    // 但**只对同网段的地址**做这个兜底 —— 换了网络之后旧 IP 在别的网段上，
+                    // 硬连只会白等 40 秒握手超时，然后把责任推给「公钥格式」。
+                    let locals = Set(GlassesDiscovery.shared.localIPv4()
+                        .filter(GlassesDiscovery.isPrivateIPv4)
+                        .map(GlassesDiscovery.subnetPrefix))
                     let remembered = GlassesDiscovery.shared.lastIP
-                    let fallback = remembered ?? extras.first
-                    if let candidate = fallback, !candidate.isEmpty {
-                        self.append("端口扫描没命中，改用记住的地址直接握手：\(candidate)")
+                    let pool = ([remembered] + extras).compactMap { $0 }.filter { !$0.isEmpty }
+                    let usable = pool.first { ip in
+                        locals.isEmpty || locals.contains(GlassesDiscovery.subnetPrefix(ip))
+                    }
+                    if let candidate = usable {
+                        self.append("端口扫描没命中，改用同网段的已知地址直接握手：\(candidate)")
                         deploy(to: candidate)
                         return
                     }
-                    // 别只丢一句「未发现」——把「怎么救」写清楚。
-                    // 0.5.6：这里以前写着「去 设置 → 本地网络 打开融合录屏」，
-                    // 可那个开关根本不存在（App 从没主动访问过局域网，系统也就没建这项），
-                    // 属于把人往死路上指。现在改成真正能做的四步。
-                    let hint = "未发现眼镜：① 确认眼镜和 iPhone 在同一个 WiFi（或眼镜连 iPhone 热点）；"
+                    // 别只丢一句「未发现」——把「怎么救」写清楚，并说清扫了哪些网段。
+                    let scanned = locals.isEmpty
+                        ? "（本机没有可扫的局域网网段）"
+                        : "（已扫 \(locals.map { $0 + ".0/24" }.joined(separator: " / "))）"
+                    let hint = "未发现眼镜\(scanned)："
+                        + "① 确认眼镜连的是同一个 WiFi（或 iPhone 热点），眼镜亮屏；"
                         + "② 确认眼镜的无线 ADB 开着（service.adb.tcp.port=5555）；"
-                        + "③ 展开「调试与参数 → 连接参数」，把已知的「眼镜 IP」填上再点连接（最省事）；"
-                        + "④ 本机 IP 读不到不影响连接 —— 本 App 只主动连眼镜，眼镜不需要连回来。"
+                        + "③ 已知 IP 的话，展开「调试与参数 → 连接参数」填上再点连接；"
+                        + "④ 换了网段仍然找不到，把部署日志里「本机接口 / 可扫网段」两行发我。"
                     self.finishFailure(hint, completion: completion)
                     return
                 }

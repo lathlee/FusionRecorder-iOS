@@ -135,8 +135,21 @@ settings:
     #                    也就永远发现不了换网段后的眼镜。
     #                 ④ 部署日志新增「可扫网段 / 读不到任何本机局域网地址」一行，
     #                    一扫不到就能判断是权限/接口问题还是眼镜侧问题。
-    MARKETING_VERSION: "0.6.0"
-    CURRENT_PROJECT_VERSION: "32"
+    #         0.6.1 = 网段扫描真正能扫到东西：
+    #                 ① 根因：一次并发开 254 条 NWConnection，把 iOS 的连接资源打满，
+    #                    大量连接在 .waiting/.failed 闪断 —— 整个 /24 扫过去一个都不命中，
+    #                    但手工连同一个地址却是通的。现在换成原始 socket
+    #                    （非阻塞 connect + poll + SO_ERROR），并发闸门 64。
+    #                 ② 扫描整体挪到后台线程（里面有 semaphore.wait，不能占主线程）。
+    #                 ③ 候选顺序改成：同网段的已知地址 → 热点段（仅在热点上下文）→
+    #                    本机各 /24 → 不同网段的旧地址垫最后。换了网络后旧 IP 不再
+    #                    排在前面浪费 1.5 秒。
+    #                 ④ 扫描失败时的兜底只连**同网段**的已知地址，不再拿别的网段的旧 IP
+    #                    硬连 40 秒、然后把锅甩给「公钥格式」。
+    #                 ⑤ 失败提示里写清扫过哪些 /24；卡片上的「眼镜 IP」只显示
+    #                    握手验证过的地址，不再拿 AppStorage 的旧值冒充。
+    MARKETING_VERSION: "0.6.1"
+    CURRENT_PROJECT_VERSION: "33"
     # 侧载不需要 Apple 签名，签名交给 SideStore / AltStore 用免费 Apple ID 做
     CODE_SIGNING_ALLOWED: "NO"
     CODE_SIGNING_REQUIRED: "NO"
