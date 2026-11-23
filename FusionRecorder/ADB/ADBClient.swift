@@ -72,6 +72,11 @@ final class ADBClient {
 
     // MARK: - 连接
 
+    /// 握手总时限。真机上如果眼镜没点「允许调试」，adbd 会一直等，**永远不回 CNXN**，
+    /// 而 connect 的回调也就永远不触发 —— UI 上就是「正在连接眼镜…」无限转圈，
+    /// 看上去像「IP 不对」，其实是在等眼镜亮屏点授权框。
+    static let handshakeTimeout: TimeInterval = 40
+
     func connect(completion: @escaping (Result<Void, Error>) -> Void) {
         queue.sync { connectHandlers.append(completion) }
         connection.stateUpdateHandler = { [weak self] state in
@@ -89,6 +94,19 @@ final class ADBClient {
             }
         }
         connection.start(queue: queue)
+
+        // 12 秒还没握手完 → 先把「去眼镜上点允许」喊出来（不判失败，只提示）
+        queue.asyncAfter(deadline: .now() + 12) { [weak self] in
+            guard let self = self, !self.isReady else { return }
+            self.log?("还在等设备应答：现在**戴上眼镜亮屏**，看到「允许 USB 调试吗」就点允许并勾选始终允许")
+        }
+        // 超时才算失败，让流程能收尾、能重试，而不是无限转圈
+        queue.asyncAfter(deadline: .now() + Self.handshakeTimeout) { [weak self] in
+            guard let self = self, !self.isReady else { return }
+            self.log?("握手超时 \(Int(Self.handshakeTimeout))s：未收到 CNXN")
+            self.failAll(ADBError.connectionFailed(
+                "握手超时：请点亮眼镜，在屏幕上点「允许 USB 调试」（勾选始终允许）后重试"))
+        }
     }
 
     func disconnect() {

@@ -865,16 +865,40 @@ final class RecorderSession: ObservableObject {
                             knownSize: size > 0 ? size : nil) { pullResult in
                     switch pullResult {
                     case .success(let data):
-                        // 注意：实拍验证过这张 JPEG **不需要**旋转 180°。
-                        // 录像走编码器 Surface，HAL 不做旋转（所以合成时要补 ±180）；
-                        // JPEG 由 HAL 按 sensor 方向输出，已经是正的。
-                        completion(UIImage(data: data)?.cgImage, nil)
+                        // ★ 0.5.3 纠正：这张 JPEG **需要**旋转 180°。
+                        // 之前判断「JPEG 已是正的」是错的 —— 真机把它贴进预览后
+                        // 桌子、键盘全挂在头顶（用户一眼看出摄像头画面是倒的）。
+                        // 原因有两层：
+                        //   1) 这台的 JPEG 里 EXIF Orientation=0（无效值），
+                        //      UIImage 不会做任何旋转；
+                        //   2) 像素本身就是 sensor 原生方向（sensor 倒装 180°），
+                        //      录像走编码器时也要补 180° 才正立，两者同源。
+                        // 所以这里的 JPEG 必须和录像路径一样补 180°，预览才不会倒。
+                        let raw = UIImage(data: data)?.cgImage
+                        completion(raw.flatMap(Self.rotated180), nil)
                     case .failure(let error):
                         completion(nil, error.localizedDescription)
                     }
                 }
             }
         }
+    }
+
+    /// 把 CGImage 旋转 180°（逐行倒序拷贝，纯 CoreGraphics，不依赖 UIKit 方向元数据）。
+    static func rotated180(_ image: CGImage) -> CGImage? {
+        let w = image.width
+        let h = image.height
+        guard w > 0, h > 0,
+              let space = CGColorSpace(name: CGColorSpace.sRGB) ?? image.colorSpace,
+              let ctx = CGContext(data: nil, width: w, height: h,
+                                  bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: space,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return nil }
+        ctx.translateBy(x: CGFloat(w), y: CGFloat(h))
+        ctx.rotate(by: .pi)
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+        return ctx.makeImage()
     }
 
     // MARK: - 日志

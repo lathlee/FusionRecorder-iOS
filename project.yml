@@ -57,8 +57,14 @@ settings:
     #                 麦克风要 3.5 秒才吐第一个采样，音轨会整体错位），改用
     #                 AudioRecord.getTimestamp(TIMEBASE_MONOTONIC) 反推第 0 帧真实时刻；
     #                 读循环改非阻塞轮询 + 尾部排空加硬上限（原来停止会卡 7 秒）
-    MARKETING_VERSION: "0.5.2"
-    CURRENT_PROJECT_VERSION: "23"
+    #         0.5.3 = ① 没连上眼镜不再显示旧预览（FrameStore 启动不恢复旧帧/样例），
+    #                  ADB 握手加 12s 提示 + 40s 超时，不再无限「正在连接」；
+    #                 ② 眼镜名字只显示设备自报的 ro.product.model（ARGlasses），
+    #                  不再写死「玄景」；本机 IP 只显示局域网私有地址，不同网段给警告；
+    #                 ③ 刷新预览的相机快照补 180°（此前判断「JPEG 已是正的」是错的）；
+    #                 ④ 界面按深色卡片风格重做（渐变底/卡片分层/状态胶囊/分组图标）
+    MARKETING_VERSION: "0.5.3"
+    CURRENT_PROJECT_VERSION: "24"
     # 侧载不需要 Apple 签名，签名交给 SideStore / AltStore 用免费 Apple ID 做
     CODE_SIGNING_ALLOWED: "NO"
     CODE_SIGNING_REQUIRED: "NO"

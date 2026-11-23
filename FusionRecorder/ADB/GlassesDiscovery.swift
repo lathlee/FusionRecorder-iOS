@@ -110,6 +110,36 @@ final class GlassesDiscovery {
         return all.first
     }
 
+    /// 界面上「本机 IP」该显示哪个：只认局域网私有地址。
+    ///
+    /// 真机踩过：iPhone 开着 VPN 时 `localIPv4()` 里会先冒出 16.2.0.0 这类
+    /// 虚拟接口地址，直接显示出来会让人以为是「IP 不对」。
+    /// 这里只在 RFC1918 里挑，挑不到就返回 nil，由界面显示「未获取」并给建议。
+    func lanIP(for glassesIP: String?) -> String? {
+        let all = localIPv4()
+        if let same = Self.pickLocalIP(from: all.filter(Self.isPrivateIPv4), glassesIP: glassesIP) {
+            return same
+        }
+        return nil
+    }
+
+    static func isPrivateIPv4(_ s: String) -> Bool {
+        let p = s.split(separator: ".").compactMap { Int($0) }
+        guard p.count == 4 else { return false }
+        if p[0] == 10 { return true }
+        if p[0] == 192 && p[1] == 168 { return true }
+        if p[0] == 172 && (16...31).contains(p[1]) { return true }
+        return false
+    }
+
+    /// 两个地址是否在同一 /24（眼镜和 iPhone 必须同网段才能互连）。
+    static func sameSubnet(_ a: String, _ b: String) -> Bool {
+        let pa = a.split(separator: ".").compactMap { Int($0) }
+        let pb = b.split(separator: ".").compactMap { Int($0) }
+        guard pa.count == 4, pb.count == 4 else { return false }
+        return pa[0] == pb[0] && pa[1] == pb[1] && pa[2] == pb[2]
+    }
+
     /// 扫描候选地址：上次成功的 IP 优先，然后本机各网段的 /24。
     func candidateIPs() -> [String] {
         var ordered: [String] = []

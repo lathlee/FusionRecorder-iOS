@@ -42,6 +42,10 @@ final class CaptureOrchestrator: ObservableObject {
     @Published private(set) var deviceModel = ""
     @Published private(set) var deviceSerial = ""
 
+    /// 是否已和眼镜完成 ADB 握手并授权。界面用它决定「预览区能不能显示真实画面」：
+    /// 没连上就只显示占位，绝不回落到上一次的旧画面（真机上会被误读成「已连上」）。
+    @Published private(set) var isConnected = false
+
     /// 已授权的那条 ADB 连接（部署完成后 RecorderSession 直接复用，
     /// 不再另开第二条 —— 真机上第二条连接经常卡在 AUTH/PUBLICKEY 上不返回）。
     private(set) var adb: ADBClient?
@@ -310,6 +314,7 @@ final class CaptureOrchestrator: ObservableObject {
                 return
             case .success:
                 self.append("ADB 已授权并握手完成，指纹 \(ADBAuth.shared.fingerprint)")
+                DispatchQueue.main.async { self.isConnected = true }
                 self.verifyShell(client: client, phoneIP: phoneIP, completion: completion)
             }
         }
@@ -571,6 +576,7 @@ final class CaptureOrchestrator: ObservableObject {
 
     private func finishFailure(_ message: String, completion: @escaping (Result<String, Error>) -> Void) {
         DispatchQueue.main.async {
+            self.isConnected = false
             self.stage = .failed
             self.stageDetail = message
             self.isBusy = false

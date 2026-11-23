@@ -19,6 +19,8 @@ import CoreGraphics
 import UIKit
 
 enum FrameOrigin: String {
+    /// 0.5.3 新增：还没有任何真实帧。预览区显示占位，**不再回落到旧帧**。
+    case none = "暂无画面"
     case sample = "内置 PoC 真实帧"
     case glasses = "眼镜实时抓帧"
     case photos = "相册导入"
@@ -28,8 +30,8 @@ final class FrameStore: ObservableObject {
 
     @Published private(set) var screenImage: CGImage?
     @Published private(set) var cameraImage: CGImage?
-    @Published private(set) var origin: FrameOrigin = .sample
-    @Published private(set) var note: String = "来自交接包双路 H264 的真实解码帧"
+    @Published private(set) var origin: FrameOrigin = .none
+    @Published private(set) var note: String = "连接眼镜后点「刷新预览」抓一帧真实画面"
     /// 每次换帧 +1，供预览层判断是否需要重新合成
     @Published private(set) var revision: Int = 0
 
@@ -41,16 +43,44 @@ final class FrameStore: ObservableObject {
     private var screenFile: URL { documentsURL.appendingPathComponent("preview_screen.png") }
     private var cameraFile: URL { documentsURL.appendingPathComponent("preview_camera.png") }
 
+    /// 两张真实帧都到位才算「有画面可显示」。
+    var hasFrames: Bool { screenImage != nil && cameraImage != nil }
+
+    /// Documents 里是否还留着上一次抓的两帧（供调试区「恢复上次抓取的两帧」用）
+    var hasSavedFrames: Bool {
+        fileManager.fileExists(atPath: screenFile.path)
+            && fileManager.fileExists(atPath: cameraFile.path)
+    }
+
     init() {
-        // 优先恢复上次抓/导入的真实帧，没有则用内置 PoC 帧
-        if let s = loadPNG(screenFile), let c = loadPNG(cameraFile) {
-            screenImage = s
-            cameraImage = c
-            origin = .photos
-            note = "已恢复上次保存的两张真实帧"
-        } else {
-            resetToSample()
-        }
+        // ★ 0.5.3：启动时**不再**恢复上次保存的帧，也不再用内置样例兜底。
+        // 真机踩过：眼镜连不上时界面照样显示上一次的合成画面，看起来像「连上了」，
+        // 于是把问题指向「IP 不对」——其实预览是旧的。没有新帧就老实显示占位。
+        // 保存的文件仍然留在 Documents，需要时由用户点「恢复上次抓取的两帧」显式加载。
+        screenImage = nil
+        cameraImage = nil
+        origin = .none
+        note = "连接眼镜后点「刷新预览」抓一帧真实画面"
+    }
+
+    /// 断开连接 / 部署失败时调用：把预览退回占位，不留旧画面。
+    func clear() {
+        guard screenImage != nil || cameraImage != nil || origin != .none else { return }
+        screenImage = nil
+        cameraImage = nil
+        origin = .none
+        note = "连接眼镜后点「刷新预览」抓一帧真实画面"
+        revision += 1
+    }
+
+    /// 显式恢复上一次抓/导入的两帧（调试用，不会自动触发）。
+    func restoreSaved() {
+        guard let s = loadPNG(screenFile), let c = loadPNG(cameraFile) else { return }
+        screenImage = s
+        cameraImage = c
+        origin = .photos
+        note = "已恢复上次保存的两张真实帧（调试用，不是当前眼镜画面）"
+        revision += 1
     }
 
     // MARK: - 内置真实帧

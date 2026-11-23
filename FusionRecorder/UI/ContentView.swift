@@ -2,17 +2,20 @@
 //  ContentView.swift
 //  FusionRecorder
 //
-//  0.5.0 界面重排：
-//    · 预览画面置顶；
-//    · 预览正下方固定三颗按钮：开始录制 / 打开相册 / 刷新预览；
-//    · 再下面一条「当前连接」信息栏（眼镜名称、局域网/热点、IP）；
-//    · 其余全部（提示语、调试按钮、参数设置、日志）**默认收起**，点一下才展开。
+//  界面结构（0.5.3 视觉重做，功能与 0.5.2 一致）：
+//    顶部品牌行 → 预览卡 → 主按钮 + 两颗次按钮 → 连接状态卡 → 折叠的调试与参数
 //
-//  刷新预览 = 让眼镜抓一帧真实屏幕（screencap）+ 一帧真实相机（APK 的 SNAPSHOT 动作），
-//  各解成 CGImage 后交给 FrameStore，预览立刻用同一份 FusionCompositor 重新合成。
-//  所以调滑杆看到的画面，就是成片会长的样子。
+//  0.5.3 的三处行为修正：
+//    1. **没连上眼镜就不显示预览**。以前 FrameStore 启动时会把上一次抓的两帧
+//       （或内置样例）读回来，眼镜连不上时界面照样有画面，看起来像「已连接」，
+//       于是把排查方向引到「IP 不对」。现在没有真实帧就只显示占位。
+//    2. 眼镜名字只显示从设备读到的 `ro.product.model`（ARGlasses），
+//       不再回落到写死的「玄景」——这台根本不是玄景。
+//    3. 「本机 IP」只显示局域网私有地址（RFC1918）。以前会把 VPN 的
+//       16.2.0.0 虚拟接口地址显示出来，误导判断。
 //
-//  参数仍旧只有一个来源（fusionParams）：预览与录制共用，禁止两处各自解释。
+//  预览仍然是「成片同源」：两帧真实画面交给同一个 FusionCompositor 渲染，
+//  参数只有一份（fusionParams），预览与录制共用。
 //
 
 import Foundation
@@ -38,6 +41,8 @@ struct ContentView: View {
     @State private var saveNote = ""
     @State private var screenPicker: PhotosPickerItem?
     @State private var cameraPicker: PhotosPickerItem?
+    /// 本机局域网 IP（只在「局域网私有地址」里挑，见 GlassesDiscovery.lanIP）
+    @State private var lanIP = ""
 
     // iPhone 端连接（交接包 §5：POC_PC_IP / POC_SCREEN_PORT / POC_CAM_PORT）
     @AppStorage("host") private var host = "192.168.101.133"
@@ -96,6 +101,10 @@ struct ContentView: View {
         "\(fusionParams.fingerprint)|rev\(frames.revision)|\(frames.origin.rawValue)"
     }
 
+    private var canvasRatio: CGFloat {
+        CGFloat(fusionParams.canvasWidth) / CGFloat(max(1, fusionParams.canvasHeight))
+    }
+
     private var statusText: String {
         if session.isRunning {
             return "离线录制中 \(session.recordingElapsed)s：眼镜本地录两路 mp4 和一条音轨，停止后自动传回 iPhone 合成。"
@@ -105,9 +114,9 @@ struct ContentView: View {
 
     /// 眼镜 IP → 连线方式。iPhone 开热点时眼镜的地址固定落在 172.20.10.0/28。
     private var linkKind: String {
-        let ip = orchestrator.glassesIP ?? host
+        let ip = connectionIP
+        if ip.isEmpty || ip == "—" { return "未连接" }
         if ip.hasPrefix("172.20.10.") { return "热点" }
-        if ip.isEmpty { return "未连接" }
         return "局域网"
     }
 
@@ -115,121 +124,31 @@ struct ContentView: View {
         orchestrator.glassesIP ?? (host.isEmpty ? "—" : host)
     }
 
+    /// 只显示设备自报的型号；没读到就说没读到，不编名字。
     private var glassesName: String {
-        if !orchestrator.deviceModel.isEmpty { return orchestrator.deviceModel }
-        return "玄景 AR 眼镜"
+        orchestrator.deviceModel.isEmpty ? "未识别到眼镜" : orchestrator.deviceModel
+    }
+
+    private var isLinked: Bool {
+        orchestrator.isConnected || orchestrator.stage == .ready
     }
 
     var body: some View {
         ZStack {
-            Palette.bg.ignoresSafeArea()
+            Palette.bgGradient.ignoresSafeArea()
 
             ScrollView {
-                VStack(alignment: .leading, spacing: 0) {
-                    HStack(alignment: .firstTextBaseline) {
-                        Text("融合录制")
-                            .font(.system(size: 20, weight: .bold))
-                            .foregroundStyle(Palette.title)
-                        Spacer()
-                        if session.isRunning {
-                            Text("● 录制中 \(session.recordingElapsed)s")
-                                .font(.system(size: 12, weight: .semibold))
-                                .foregroundStyle(Palette.green)
-                        }
-                    }
-
-                    // ---- 真实帧合成预览（成片宽高比，画布 = 成片分辨率）----
-                    FusionPreview(frames: frames, params: fusionParams,
-                                  token: renderToken, exported: $currentComposite)
-                        .aspectRatio(Double(fusionParams.canvasWidth) / Double(fusionParams.canvasHeight),
-                                     contentMode: .fit)
-                        .padding(.top, 10)
-
-                    // ---- 预览下方固定三颗按钮 ----
-                    HStack(spacing: 8) {
-                        Button(action: toggleRecording) {
-                            Text(session.isRunning ? "停止录制" : "开始录制")
-                                .font(.system(size: 15, weight: .semibold))
-                                .foregroundStyle(.white)
-                                .frame(maxWidth: .infinity)
-                                .padding(.vertical, 11)
-                                .background(session.isRunning ? Palette.danger : Palette.accent)
-                                .clipShape(RoundedRectangle(cornerRadius: 8))
-                        }
-                        .buttonStyle(.plain)
-
-                        Button(action: openPhotos) {
-                            Text("打开相册")
-                                .font(.system(size: 14))
-                                .foregroundStyle(Palette.title)
-                                .frame(maxWidth: .infinity)
-                                .padding(.vertical, 11)
-                                .background(Palette.field)
-                                .clipShape(RoundedRectangle(cornerRadius: 8))
-                        }
-                        .buttonStyle(.plain)
-
-                        Button(action: refreshPreview) {
-                            HStack(spacing: 4) {
-                                if session.previewBusy {
-                                    ProgressView().scaleEffect(0.6)
-                                }
-                                Text(session.previewBusy ? "抓取中" : "刷新预览")
-                                    .font(.system(size: 14))
-                            }
-                            .foregroundStyle(Palette.title)
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 11)
-                            .background(Palette.field)
-                            .clipShape(RoundedRectangle(cornerRadius: 8))
-                        }
-                        .buttonStyle(.plain)
-                        .disabled(session.previewBusy)
-                    }
-                    .padding(.top, 10)
-
-                    if !session.previewNote.isEmpty {
-                        Text(session.previewNote)
-                            .font(.system(size: 11))
-                            .foregroundStyle(Palette.secondary)
-                            .padding(.top, 6)
-                    }
-
-                    // ---- 当前连接 ----
-                    connectionBar
-                        .padding(.top, 10)
-
-                    // ---- 折叠开关：其余全部内容默认收起 ----
-                    Button {
-                        withAnimation(.easeInOut(duration: 0.18)) { showAdvanced.toggle() }
-                    } label: {
-                        HStack(spacing: 6) {
-                            Image(systemName: showAdvanced ? "chevron.up" : "chevron.down")
-                                .font(.system(size: 11, weight: .bold))
-                            Text(showAdvanced ? "收起调试与参数" : "展开调试与参数")
-                                .font(.system(size: 13))
-                            Spacer()
-                            if !showAdvanced {
-                                Text("参数 · 日志 · 调试")
-                                    .font(.system(size: 11))
-                                    .foregroundStyle(Palette.hint)
-                            }
-                        }
-                        .foregroundStyle(Palette.section)
-                        .padding(.vertical, 10)
-                        .padding(.horizontal, 12)
-                        .frame(maxWidth: .infinity)
-                        .background(Palette.field)
-                        .clipShape(RoundedRectangle(cornerRadius: 8))
-                    }
-                    .buttonStyle(.plain)
-                    .padding(.top, 10)
-
-                    if showAdvanced {
-                        advancedPanel
-                    }
+                VStack(spacing: 12) {
+                    header
+                    previewCard
+                    actionButtons
+                    connectionCard
+                    advancedToggle
+                    if showAdvanced { advancedPanel }
                 }
-                .padding(12)
+                .padding(.horizontal, 16)
+                .padding(.top, 6)
+                .padding(.bottom, 30)
             }
 
             if session.offlinePhase == .recording {
@@ -253,9 +172,18 @@ struct ContentView: View {
             session.frameStore = frames
             session.orchestrator = orchestrator
             session.update(params: fusionParams)
+            refreshLanIP()
         }
         .onChange(of: fusionParams) { newValue in
             session.update(params: newValue)
+        }
+        .onChange(of: orchestrator.glassesIP) { _ in
+            refreshLanIP()
+        }
+        // 断开就清掉预览：留着旧画面会让人误以为还连着
+        .onChange(of: orchestrator.isConnected) { connected in
+            if !connected { frames.clear() }
+            refreshLanIP()
         }
         .onChange(of: session.finishedMovieURL) { url in
             if url != nil { showSaveDone = true }
@@ -284,318 +212,672 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - 当前连接栏
+    // MARK: - 顶部品牌行
 
-    private var connectionBar: some View {
-        HStack(spacing: 10) {
-            Circle()
-                .fill(orchestrator.stage == .ready ? Palette.green
-                      : (orchestrator.glassesIP == nil ? Palette.hint : Palette.accent))
-                .frame(width: 7, height: 7)
-
-            VStack(alignment: .leading, spacing: 1) {
-                Text(glassesName)
-                    .font(.system(size: 13, weight: .semibold))
+    private var header: some View {
+        HStack(alignment: .center, spacing: 10) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text("融合录制")
+                    .font(.system(size: 26, weight: .bold))
                     .foregroundStyle(Palette.title)
-                    .lineLimit(1)
-                Text(connectionDetail)
-                    .font(.system(size: 11))
-                    .foregroundStyle(Palette.secondary)
-                    .lineLimit(1)
+                Text("眼镜画面 · 屏幕叠加 · 一次成片")
+                    .font(.system(size: 12))
+                    .foregroundStyle(Palette.hint)
             }
-
-            Spacer()
-
-            Text(linkKind)
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(Palette.section)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 3)
-                .background(Palette.field)
-                .clipShape(Capsule())
+            Spacer(minLength: 8)
+            statusPill
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 9)
-        .frame(maxWidth: .infinity)
-        .background(Palette.card)
-        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .padding(.top, 4)
     }
 
-    private var connectionDetail: String {
-        var parts = ["IP \(connectionIP)"]
-        if !orchestrator.deviceSerial.isEmpty {
-            parts.append("SN \(orchestrator.deviceSerial)")
+    private var statusPill: some View {
+        let running = session.isRunning
+        let connecting = orchestrator.isBusy
+        let color: Color = running ? Palette.danger
+            : (connecting ? Palette.accent : (isLinked ? Palette.green : Palette.hint))
+        let text: String = running ? "录制中 \(session.recordingElapsed)s"
+            : (connecting ? "连接中" : (isLinked ? "已就绪" : "未连接"))
+        return HStack(spacing: 6) {
+            Circle()
+                .fill(color)
+                .frame(width: 7, height: 7)
+                .shadow(color: color.opacity(0.8), radius: 4)
+            Text(text)
+                .font(.system(size: 11.5, weight: .semibold))
+                .foregroundStyle(color)
         }
-        if let phone = orchestrator.iphoneIP, !phone.isEmpty {
-            parts.append("本机 \(phone)")
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(color.opacity(0.12))
+        .clipShape(Capsule())
+        .overlay(Capsule().strokeBorder(color.opacity(0.25), lineWidth: 1))
+    }
+
+    // MARK: - 预览卡
+
+    private var previewCard: some View {
+        Group {
+            if frames.hasFrames {
+                FusionPreview(frames: frames, params: fusionParams,
+                              token: renderToken, exported: $currentComposite)
+            } else {
+                previewPlaceholder
+            }
         }
-        return parts.joined(separator: " · ")
+        .aspectRatio(canvasRatio, contentMode: .fit)
+        .frame(maxWidth: .infinity)
+        .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .strokeBorder(frames.hasFrames ? Palette.strokeStrong : Palette.stroke, lineWidth: 1)
+        )
+        .overlay(alignment: .topLeading) { previewChip }
+        .overlay(alignment: .bottomTrailing) { canvasBadge }
+        .shadow(color: Color.black.opacity(0.45), radius: 18, x: 0, y: 10)
+    }
+
+    private var previewChip: some View {
+        HStack(spacing: 5) {
+            Image(systemName: frames.hasFrames ? "play.rectangle.fill" : "eyeglasses")
+                .font(.system(size: 9, weight: .bold))
+            Text(frames.hasFrames ? "成片预览" : "无信号")
+                .font(.system(size: 10.5, weight: .semibold))
+        }
+        .foregroundStyle(frames.hasFrames ? Palette.title : Palette.hint)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(.ultraThinMaterial)
+        .clipShape(Capsule())
+        .padding(10)
+    }
+
+    private var canvasBadge: some View {
+        Text("\(fusionParams.canvasWidth)×\(fusionParams.canvasHeight)")
+            .font(.system(size: 10, weight: .medium, design: .monospaced))
+            .foregroundStyle(Palette.secondary)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 3)
+            .background(.ultraThinMaterial)
+            .clipShape(Capsule())
+            .padding(10)
+    }
+
+    /// 没连上 / 还没抓帧时的占位。★ 绝不在这里回落到旧画面。
+    private var previewPlaceholder: some View {
+        ZStack {
+            LinearGradient(colors: [Palette.card, Palette.bg],
+                           startPoint: .topLeading, endPoint: .bottomTrailing)
+
+            VStack(spacing: 10) {
+                ZStack {
+                    Circle()
+                        .fill(Palette.accent.opacity(0.14))
+                        .frame(width: 62, height: 62)
+                    if orchestrator.isBusy {
+                        ProgressView().tint(Palette.accent)
+                    } else {
+                        Image(systemName: "eyeglasses")
+                            .font(.system(size: 25, weight: .medium))
+                            .foregroundStyle(Palette.accent)
+                    }
+                }
+
+                Text(placeholderTitle)
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(Palette.title)
+
+                Text(placeholderDetail)
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(Palette.hint)
+                    .multilineTextAlignment(.center)
+                    .lineSpacing(2)
+                    .padding(.horizontal, 26)
+
+                if !orchestrator.isBusy {
+                    Button(action: autoDeploy) {
+                        Text(orchestrator.stage == .failed ? "重试连接" : "连接眼镜")
+                            .font(.system(size: 12.5, weight: .semibold))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 18)
+                            .padding(.vertical, 8)
+                            .background(Palette.accentGradient)
+                            .clipShape(Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.top, 2)
+                }
+            }
+            .padding(16)
+        }
+    }
+
+    private var placeholderTitle: String {
+        if orchestrator.isBusy { return "正在连接眼镜…" }
+        if orchestrator.stage == .failed { return "连接失败" }
+        return "尚未连接眼镜"
+    }
+
+    private var placeholderDetail: String {
+        if orchestrator.isBusy {
+            return "首次连接要在眼镜屏幕上点「允许 USB 调试」"
+        }
+        if orchestrator.stage == .failed {
+            return orchestrator.stageDetail.isEmpty ? "点下方重试连接" : orchestrator.stageDetail
+        }
+        return "连接后点「刷新预览」抓一帧真实画面\n没抓过帧就不显示旧画面"
+    }
+
+    // MARK: - 三颗主按钮
+
+    private var actionButtons: some View {
+        VStack(spacing: 9) {
+            Button(action: toggleRecording) {
+                HStack(spacing: 7) {
+                    Image(systemName: session.isRunning ? "stop.fill" : "record.circle")
+                        .font(.system(size: 15, weight: .bold))
+                    Text(session.isRunning ? "停止录制" : "开始录制")
+                        .font(.system(size: 16, weight: .semibold))
+                }
+                .foregroundStyle(.white)
+                .frame(maxWidth: .infinity)
+                .frame(height: 52)
+                .background(session.isRunning ? AnyShapeStyle(Palette.recordGradient)
+                                              : AnyShapeStyle(Palette.accentGradient))
+                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                .shadow(color: (session.isRunning ? Color.red : Palette.accent).opacity(0.35),
+                        radius: 12, x: 0, y: 6)
+            }
+            .buttonStyle(.plain)
+
+            HStack(spacing: 9) {
+                secondaryButton(title: "打开相册", icon: "photo.on.rectangle") {
+                    openPhotos()
+                }
+                secondaryButton(title: session.previewBusy ? "抓取中" : "刷新预览",
+                                icon: "arrow.triangle.2.circlepath",
+                                busy: session.previewBusy) {
+                    refreshPreview()
+                }
+                .disabled(session.previewBusy)
+            }
+
+            if !session.previewNote.isEmpty {
+                Text(session.previewNote)
+                    .font(.system(size: 11))
+                    .foregroundStyle(Palette.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 2)
+            }
+        }
+    }
+
+    private func secondaryButton(title: String, icon: String, busy: Bool = false,
+                                 action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 6) {
+                if busy {
+                    ProgressView().scaleEffect(0.55).tint(Palette.label)
+                } else {
+                    Image(systemName: icon).font(.system(size: 12, weight: .semibold))
+                }
+                Text(title).font(.system(size: 13.5, weight: .medium))
+            }
+            .foregroundStyle(Palette.label)
+            .frame(maxWidth: .infinity)
+            .frame(height: 44)
+            .background(Palette.field)
+            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .strokeBorder(Palette.stroke, lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+    }
+
+    // MARK: - 连接状态卡
+
+    private var connectionCard: some View {
+        SurfaceCard(padding: 14) {
+            VStack(spacing: 11) {
+                HStack(spacing: 10) {
+                    Circle()
+                        .fill(isLinked ? Palette.green : Palette.hint)
+                        .frame(width: 8, height: 8)
+                        .shadow(color: (isLinked ? Palette.green : Color.clear).opacity(0.8), radius: 4)
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(glassesName)
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(Palette.title)
+                            .lineLimit(1)
+                        Text(deviceLine)
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundStyle(Palette.secondary)
+                            .lineLimit(1)
+                    }
+
+                    Spacer(minLength: 6)
+
+                    Text(linkKind)
+                        .font(.system(size: 10.5, weight: .semibold))
+                        .foregroundStyle(isLinked ? Palette.section : Palette.hint)
+                        .padding(.horizontal, 9)
+                        .padding(.vertical, 4)
+                        .background((isLinked ? Palette.section : Palette.hint).opacity(0.12))
+                        .clipShape(Capsule())
+                }
+
+                if let warning = networkWarning {
+                    HStack(alignment: .top, spacing: 7) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 11))
+                            .foregroundStyle(Palette.warn)
+                        Text(warning)
+                            .font(.system(size: 11))
+                            .foregroundStyle(Palette.warn)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Spacer(minLength: 0)
+                    }
+                    .padding(9)
+                    .background(Palette.warn.opacity(0.10))
+                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                }
+
+                Divider().overlay(Palette.stroke)
+
+                HStack(spacing: 8) {
+                    Image(systemName: "wifi")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Palette.hint)
+                    Text("本机 \(lanIPLabel)")
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(Palette.secondary)
+                    Spacer(minLength: 6)
+                    Button(action: rescan) {
+                        HStack(spacing: 4) {
+                            Image(systemName: "dot.radiowaves.left.and.right")
+                                .font(.system(size: 10, weight: .bold))
+                            Text("重新扫描")
+                                .font(.system(size: 11, weight: .medium))
+                        }
+                        .foregroundStyle(Palette.accent)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(orchestrator.isBusy)
+                }
+            }
+        }
+    }
+
+    private var deviceLine: String {
+        var parts: [String] = []
+        if connectionIP != "—" { parts.append("IP \(connectionIP)") }
+        if !orchestrator.deviceSerial.isEmpty { parts.append("SN \(orchestrator.deviceSerial)") }
+        if parts.isEmpty { parts.append("尚未连接") }
+        return parts.joined(separator: "  ·  ")
+    }
+
+    private var lanIPLabel: String {
+        lanIP.isEmpty ? "未获取到局域网 IP" : lanIP
+    }
+
+    /// 网段不一致 / 取不到局域网 IP 时给出可执行的提示。
+    private var networkWarning: String? {
+        if orchestrator.isBusy { return nil }
+        if lanIP.isEmpty {
+            return "没取到 iPhone 的局域网 IP：确认已连 WiFi 或已开热点，再点「重新扫描」"
+        }
+        let g = connectionIP
+        if g != "—", !GlassesDiscovery.sameSubnet(lanIP, g) {
+            return "iPhone(\(lanIP)) 与眼镜(\(g)) 不在同一网段：让两者连同一个 WiFi，或开热点让眼镜连 iPhone"
+        }
+        return nil
+    }
+
+    // MARK: - 折叠开关
+
+    private var advancedToggle: some View {
+        Button {
+            withAnimation(.easeInOut(duration: 0.2)) { showAdvanced.toggle() }
+        } label: {
+            HStack(spacing: 7) {
+                Image(systemName: "slider.horizontal.3")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(Palette.section)
+                Text(showAdvanced ? "收起调试与参数" : "调试与参数")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(Palette.title)
+                Spacer()
+                if !showAdvanced {
+                    Text("参数 · 日志 · 调试")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Palette.hint)
+                }
+                Image(systemName: showAdvanced ? "chevron.up" : "chevron.down")
+                    .font(.system(size: 11, weight: .bold))
+                    .foregroundStyle(Palette.hint)
+            }
+            .padding(.horizontal, 14)
+            .frame(height: 46)
+            .background(Palette.card)
+            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .strokeBorder(Palette.stroke, lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
     }
 
     // MARK: - 折叠区（提示语 / 调试 / 参数 / 日志）
 
     private var advancedPanel: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Text(statusText)
-                .font(.system(size: 12))
-                .foregroundStyle(Palette.secondary)
-                .padding(.top, 10)
-
-            HStack {
-                Text("融合效果预览 · 真实帧合成")
-                Spacer()
-                Text("预览 = 成片同源")
-                    .foregroundStyle(Palette.section)
+        VStack(spacing: 12) {
+            SurfaceCard {
+                Text(statusText)
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(Palette.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
-            .font(.system(size: 11))
-            .foregroundStyle(Palette.hint)
-            .padding(.top, 8)
 
             // ---- 真实帧来源 ----
-            sectionTitle("真实帧来源")
-            Text(frames.origin.rawValue + "：" + frames.note)
-                .font(.system(size: 11))
-                .foregroundStyle(Palette.label)
-                .padding(.top, 2)
+            blockCard("真实帧来源", icon: "photo.stack") {
+                VStack(alignment: .leading, spacing: 9) {
+                    Text("\(frames.origin.rawValue)：\(frames.note)")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Palette.label)
+                        .fixedSize(horizontal: false, vertical: true)
 
-            HStack(spacing: 8) {
-                smallButton("恢复内置真实帧") { frames.resetToSample() }
-                smallButton("用眼镜实时画面") { refreshPreview() }
-            }
-            .padding(.top, 6)
-
-            HStack(spacing: 8) {
-                PhotosPicker(selection: $screenPicker, matching: .images) {
-                    smallLabel("导入屏幕帧")
-                }
-                .onChange(of: screenPicker) { item in
-                    loadPicked(item, isScreen: true)
-                }
-                PhotosPicker(selection: $cameraPicker, matching: .images) {
-                    smallLabel("导入相机帧")
-                }
-                .onChange(of: cameraPicker) { item in
-                    loadPicked(item, isScreen: false)
-                }
-                smallButton("保存当前合成帧") { saveCurrentFrame() }
-            }
-            .padding(.top, 6)
-
-            if !saveNote.isEmpty {
-                Text(saveNote)
-                    .font(.system(size: 11))
-                    .foregroundStyle(Palette.section)
-                    .padding(.top, 4)
-            }
-
-            // ---- 调试按钮 ----
-            sectionTitle("调试")
-            actionButton("检测屏幕采集（约 20 秒，先看这条能不能通）") {
-                showProbeNote = true
-            }
-            .padding(.top, 6)
-
-            actionButton(showLog ? "隐藏崩溃日志" : "查看崩溃日志") {
-                showLog.toggle()
-            }
-            .padding(.top, 6)
-
-            if showLog {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("阶段 \(session.offlinePhase.rawValue) · \(session.phaseDetail) · 日志 \(session.log.count) 条")
-                        .font(.system(size: 11, design: .monospaced))
-                    ForEach(session.log, id: \.self) { line in
-                        Text(line)
-                            .font(.system(size: 11, design: .monospaced))
+                    HStack(spacing: 8) {
+                        miniButton("用眼镜实时画面") { refreshPreview() }
+                        miniButton("内置样例帧") { frames.resetToSample() }
+                    }
+                    HStack(spacing: 8) {
+                        if frames.hasSavedFrames {
+                            miniButton("恢复上次两帧") { frames.restoreSaved() }
+                        }
+                        PhotosPicker(selection: $screenPicker, matching: .images) {
+                            miniLabel("导入屏幕帧")
+                        }
+                        .onChange(of: screenPicker) { item in
+                            loadPicked(item, isScreen: true)
+                        }
+                        PhotosPicker(selection: $cameraPicker, matching: .images) {
+                            miniLabel("导入相机帧")
+                        }
+                        .onChange(of: cameraPicker) { item in
+                            loadPicked(item, isScreen: false)
+                        }
+                        miniButton("保存合成帧") { saveCurrentFrame() }
+                    }
+                    if !saveNote.isEmpty {
+                        Text(saveNote)
+                            .font(.system(size: 11))
+                            .foregroundStyle(Palette.section)
                     }
                 }
-                .foregroundStyle(Palette.danger)
-                .padding(.top, 8)
             }
 
-            sectionTitle("全自动录制（v0.5 离线架构）")
-            Text("状态：\(orchestrator.stage.rawValue) — \(orchestrator.stageDetail)")
-                .font(.system(size: 11))
-                .foregroundStyle(orchestrator.stage == .failed ? Palette.danger : Palette.section)
-            HStack(spacing: 8) {
-                smallButton(orchestrator.isBusy ? "部署中…" : "① 自动部署采集端") {
-                    autoDeploy()
-                }
-                smallButton(orchestrator.isBusy ? "请稍候" : "② 全自动录制") {
-                    autoRecord()
-                }
-            }
-            .padding(.top, 6)
-            Text("① 只装好眼镜端（扫 5555 → ADB 授权 → push APK/JAR → 授权相机与麦克风）；② 部署完直接开录。眼镜 IP 留空自动扫描。首次 ADB 需在眼镜上点「允许调试」。")
-                .font(.system(size: 11))
-                .foregroundStyle(Palette.hint)
-                .padding(.top, 4)
-            if !orchestrator.log.isEmpty {
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("部署日志：").font(.system(size: 11, design: .monospaced))
-                    ForEach(orchestrator.log.suffix(8), id: \.self) { line in
-                        Text(line).font(.system(size: 10, design: .monospaced))
+            // ---- 全自动部署 ----
+            blockCard("部署与连接", icon: "antenna.radiowaves.left.and.right") {
+                VStack(alignment: .leading, spacing: 9) {
+                    HStack(spacing: 6) {
+                        Text(orchestrator.stage.rawValue)
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(orchestrator.stage == .failed ? Palette.danger
+                                             : (isLinked ? Palette.green : Palette.secondary))
+                            .padding(.horizontal, 8).padding(.vertical, 3)
+                            .background(Palette.field)
+                            .clipShape(Capsule())
+                        Text(orchestrator.stageDetail)
+                            .font(.system(size: 11))
+                            .foregroundStyle(Palette.hint)
+                            .lineLimit(2)
+                        Spacer(minLength: 0)
+                    }
+
+                    HStack(spacing: 8) {
+                        miniButton(orchestrator.isBusy ? "部署中…" : "① 部署采集端") { autoDeploy() }
+                        miniButton(orchestrator.isBusy ? "请稍候" : "② 全自动录制") { autoRecord() }
+                    }
+
+                    Text("① 只装好眼镜端（扫 5555 → ADB 授权 → push APK/JAR → 授权相机与麦克风）；② 部署完直接开录。首次 ADB 需在眼镜上点「允许调试」。")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(Palette.hint)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    if !orchestrator.log.isEmpty {
+                        logBox(orchestrator.log.suffix(10).map { $0 }, color: Palette.secondary)
                     }
                 }
-                .foregroundStyle(Palette.danger)
-                .padding(.top, 6)
+            }
+
+            // ---- 调试 ----
+            blockCard("调试", icon: "wrench.and.screwdriver") {
+                VStack(alignment: .leading, spacing: 9) {
+                    actionRow("检测屏幕采集（约 20 秒，先看这条能不能通）") { showProbeNote = true }
+                    actionRow(showLog ? "隐藏运行日志" : "查看运行日志") { showLog.toggle() }
+                    if showLog {
+                        Text("阶段 \(session.offlinePhase.rawValue) · \(session.phaseDetail) · 日志 \(session.log.count) 条")
+                            .font(.system(size: 10.5, design: .monospaced))
+                            .foregroundStyle(Palette.hint)
+                        logBox(session.log, color: Palette.danger)
+                    }
+                }
             }
 
             // ---- 采集参数 ----
-            sectionTitle("采集参数")
-            pickerRow("摄像头", selection: $cameraIndex, options: Options.cameras)
-            pickerRow("摄像头分辨率（决定输出视频分辨率）", selection: $resolutionIndex, options: Options.resolutions)
-            pickerRow("帧率", selection: $fpsIndex, options: Options.fps)
-            pickerRow("码率", selection: $bitrateIndex, options: Options.bitrates)
-            pickerRow("画面旋转校正（画面方向不对时调整）", selection: $rotateIndex, options: Options.rotations)
-            pickerRow("自动停止", selection: $durationIndex, options: Options.durations)
+            blockCard("采集参数", icon: "camera.aperture") {
+                VStack(spacing: 7) {
+                    pickerRow("摄像头", selection: $cameraIndex, options: Options.cameras)
+                    pickerRow("分辨率", selection: $resolutionIndex, options: Options.resolutions)
+                    pickerRow("帧率", selection: $fpsIndex, options: Options.fps)
+                    pickerRow("码率", selection: $bitrateIndex, options: Options.bitrates)
+                    pickerRow("画面旋转校正", selection: $rotateIndex, options: Options.rotations)
+                    pickerRow("自动停止", selection: $durationIndex, options: Options.durations)
+                }
+            }
 
             // ---- 叠加效果 ----
-            sectionTitle("叠加效果")
-            sliderRow("屏幕透明度", value: $alpha, range: 0.0...1.0)
-            sliderRow("屏幕占比", value: $scale, range: 0.2...0.95)
-            sliderRow("水平位置", value: $offsetX, range: -0.5...0.5)
-            sliderRow("垂直位置", value: $offsetY, range: -0.5...0.5)
-            sliderRow("发光强度", value: $additive, range: 0.0...1.0)
-            sliderRow("圆角", value: $corner, range: 0.0...0.5)
-            sliderRow("边缘渐隐", value: $edge, range: 0.0...0.5)
-            sliderRow("屏幕亮度", value: $brightness, range: 0.5...1.8)
-            sliderRow("摄像头对比度", value: $contrast, range: 0.6...1.6)
-            sliderRow("裁掉右侧", value: $crop, range: 0.0...0.15)
-
-            Text("悬浮球占了屏幕右侧一小条，把它裁掉即可让成品里看不到悬浮球。")
-                .font(.system(size: 11))
-                .foregroundStyle(Palette.hint)
-                .padding(.top, 4)
+            blockCard("叠加效果", icon: "square.on.square") {
+                VStack(spacing: 9) {
+                    sliderRow("屏幕透明度", value: $alpha, range: 0.0...1.0)
+                    sliderRow("屏幕占比", value: $scale, range: 0.2...0.95)
+                    sliderRow("水平位置", value: $offsetX, range: -0.5...0.5)
+                    sliderRow("垂直位置", value: $offsetY, range: -0.5...0.5)
+                    sliderRow("发光强度", value: $additive, range: 0.0...1.0)
+                    sliderRow("圆角", value: $corner, range: 0.0...0.5)
+                    sliderRow("边缘渐隐", value: $edge, range: 0.0...0.5)
+                    sliderRow("屏幕亮度", value: $brightness, range: 0.5...1.8)
+                    sliderRow("摄像头对比度", value: $contrast, range: 0.6...1.6)
+                    sliderRow("裁掉右侧", value: $crop, range: 0.0...0.15)
+                    Text("悬浮球占了屏幕右侧一小条，把它裁掉即可让成品里看不到悬浮球。")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(Palette.hint)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
 
             // ---- 声音 ----
-            sectionTitle("声音")
-            sliderRow("合成音量（倍数）", value: $audioVolume, range: 0.0...3.0)
-            HStack(spacing: 8) {
-                smallButton("还原 1.0×") { audioVolume = 1.0 }
-                smallButton("小声一点 0.7×") { audioVolume = 0.7 }
-                smallButton("放大 1.5×") { audioVolume = 1.5 }
+            blockCard("声音", icon: "waveform") {
+                VStack(spacing: 9) {
+                    sliderRow("合成音量（倍数）", value: $audioVolume, range: 0.0...3.0)
+                    HStack(spacing: 8) {
+                        miniButton("0.7×") { audioVolume = 0.7 }
+                        miniButton("1.0×") { audioVolume = 1.0 }
+                        miniButton("1.5×") { audioVolume = 1.5 }
+                    }
+                    Text("只影响之后合成的新成片，相册里已有的文件不会被改动。2.0× 以上是数字放大，环境噪声也会一起变大。")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(Palette.hint)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
-            .padding(.top, 6)
-            Text("只影响**之后**合成的新成片，相册里已有的文件不会被改动。"
-                 + "2.0× 以上是数字放大，环境噪声也会一起变大。")
-                .font(.system(size: 11))
-                .foregroundStyle(Palette.hint)
-                .padding(.top, 4)
 
-            // ---- iPhone 端连接 ----
-            sectionTitle("iPhone 端连接")
-            Text("眼镜无线 ADB 默认 5555；iPhone 开热点时眼镜连热点。")
-                .font(.system(size: 11))
-                .foregroundStyle(Palette.hint)
-                .padding(.top, 2)
-            fieldRow("眼镜 IP", text: $host, decimal: true)
-            fieldRow("iPhone IP（留空自动）", text: $iphoneHostIP, decimal: true)
-            fieldRow("屏幕流端口（9114）", text: $screenPort, decimal: false)
-            fieldRow("相机流端口（9115）", text: $cameraPort, decimal: false)
-
-            Text("成片在相册里；预览帧可单独保存下来核对。")
-                .font(.system(size: 11))
-                .foregroundStyle(Palette.hint)
-                .padding(.top, 14)
+            // ---- 连接参数 ----
+            blockCard("连接参数", icon: "network") {
+                VStack(spacing: 9) {
+                    Text("眼镜无线 ADB 默认 5555；iPhone 开热点时眼镜连热点。")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(Palette.hint)
+                        .fixedSize(horizontal: false, vertical: true)
+                    fieldRow("眼镜 IP", text: $host, decimal: true)
+                    fieldRow("iPhone IP（留空自动）", text: $iphoneHostIP, decimal: true)
+                    fieldRow("屏幕流端口", text: $screenPort, decimal: false)
+                    fieldRow("相机流端口", text: $cameraPort, decimal: false)
+                }
+            }
         }
     }
 
-    // MARK: - 控件
+    // MARK: - 组件
 
-    private func sectionTitle(_ text: String) -> some View {
-        Text(text)
-            .font(.system(size: 14, weight: .bold))
-            .foregroundStyle(Palette.section)
-            .padding(.top, 16)
+    private func blockCard<C: View>(_ title: String, icon: String,
+                                    @ViewBuilder content: () -> C) -> some View {
+        SurfaceCard {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 7) {
+                    Image(systemName: icon)
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(Palette.section)
+                    Text(title)
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(Palette.title)
+                    Spacer()
+                }
+                content()
+            }
+        }
     }
 
-    private func actionButton(_ title: String, prominent: Bool = false, action: @escaping () -> Void) -> some View {
+    private func logBox(_ lines: [String], color: Color) -> some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 2) {
+                ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
+                    Text(line)
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(color)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            .padding(8)
+        }
+        .frame(maxHeight: 170)
+        .background(Palette.bg.opacity(0.6))
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+
+    private func actionRow(_ title: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            Text(title)
-                .font(.system(size: prominent ? 16 : 14))
-                .foregroundStyle(prominent ? Color.white : Palette.title)
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 10)
-                .background(prominent ? Palette.accent : Palette.field)
-                .clipShape(RoundedRectangle(cornerRadius: 6))
+            HStack {
+                Text(title)
+                    .font(.system(size: 12.5))
+                    .foregroundStyle(Palette.label)
+                    .multilineTextAlignment(.leading)
+                Spacer(minLength: 6)
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundStyle(Palette.hint)
+            }
+            .padding(.horizontal, 11)
+            .frame(height: 40)
+            .background(Palette.field)
+            .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
         }
         .buttonStyle(.plain)
     }
 
-    private func smallButton(_ title: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            smallLabel(title)
-        }
-        .buttonStyle(.plain)
+    private func miniButton(_ title: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) { miniLabel(title) }
+            .buttonStyle(.plain)
     }
 
-    private func smallLabel(_ title: String) -> some View {
+    private func miniLabel(_ title: String) -> some View {
         Text(title)
-            .font(.system(size: 11))
-            .foregroundStyle(Palette.title)
+            .font(.system(size: 11.5))
+            .foregroundStyle(Palette.label)
             .lineLimit(1)
             .frame(maxWidth: .infinity)
-            .padding(.vertical, 8)
+            .frame(height: 34)
             .background(Palette.field)
-            .clipShape(RoundedRectangle(cornerRadius: 6))
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
 
     private func pickerRow(_ title: String, selection: Binding<Int>, options: [String]) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
+        HStack(spacing: 8) {
             Text(title)
-                .font(.system(size: 12))
+                .font(.system(size: 12.5))
                 .foregroundStyle(Palette.label)
+            Spacer(minLength: 6)
             Picker("", selection: selection) {
                 ForEach(0..<options.count, id: \.self) { index in
                     Text(options[index]).tag(index)
                 }
             }
             .pickerStyle(.menu)
-            .tint(Palette.title)
-            .padding(.vertical, 4)
-            .padding(.horizontal, 8)
-            .background(Palette.field)
-            .clipShape(RoundedRectangle(cornerRadius: 6))
+            .labelsHidden()
+            .tint(Palette.section)
         }
-        .padding(.top, 6)
+        .padding(.horizontal, 11)
+        .frame(height: 42)
+        .background(Palette.field)
+        .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
     }
 
     private func fieldRow(_ title: String, text: Binding<String>, decimal: Bool) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
+        VStack(alignment: .leading, spacing: 5) {
             Text(title)
-                .font(.system(size: 12))
-                .foregroundStyle(Palette.label)
+                .font(.system(size: 11))
+                .foregroundStyle(Palette.hint)
             TextField(title, text: text)
-                .font(.system(size: 14))
+                .font(.system(size: 13.5, design: .monospaced))
                 .foregroundStyle(Palette.title)
                 .keyboardType(decimal ? .decimalPad : .numberPad)
                 .autocorrectionDisabled()
-                .padding(8)
+                .textInputAutocapitalization(.never)
+                .padding(.horizontal, 11)
+                .frame(height: 40)
                 .background(Palette.field)
-                .clipShape(RoundedRectangle(cornerRadius: 6))
+                .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
         }
-        .padding(.top, 6)
     }
 
     private func sliderRow(_ title: String, value: Binding<Double>, range: ClosedRange<Double>) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
+        VStack(spacing: 3) {
             HStack {
                 Text(title)
-                    .font(.system(size: 12))
+                    .font(.system(size: 12.5))
                     .foregroundStyle(Palette.label)
                 Spacer()
                 Text(String(format: "%.2f", value.wrappedValue))
-                    .font(.system(size: 12, design: .monospaced))
+                    .font(.system(size: 11.5, weight: .medium, design: .monospaced))
                     .foregroundStyle(Palette.section)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 2)
+                    .background(Palette.field)
+                    .clipShape(Capsule())
             }
             Slider(value: value, in: range)
                 .tint(Palette.accent)
         }
-        .padding(.top, 8)
     }
 
     // MARK: - 行为
+
+    private func refreshLanIP() {
+        let ip = GlassesDiscovery.shared.lanIP(for: orchestrator.glassesIP ?? host) ?? ""
+        if ip != lanIP { lanIP = ip }
+    }
+
+    /// 重新扫描：忘掉上次 IP，重新在 5555 上找眼镜。
+    private func rescan() {
+        guard !orchestrator.isBusy else { return }
+        host = ""
+        GlassesDiscovery.shared.forget()
+        session.appendUser("重新扫描眼镜：忘记上次 IP，开始在 5555 上找…")
+        autoDeploy()
+    }
 
     /// 刷新预览：抓屏幕上真实的一帧 + 相机拍一张，合成后立刻显示。
     private func refreshPreview() {
@@ -646,6 +928,7 @@ struct ContentView: View {
                          iphoneHostIP: localIP.isEmpty ? nil : localIP) { [self] result in
             DispatchQueue.main.async {
                 self.autoBusy = false
+                self.refreshLanIP()
                 if case .failure(let error) = result {
                     self.session.appendUser("部署失败：\(error.localizedDescription)")
                 }
