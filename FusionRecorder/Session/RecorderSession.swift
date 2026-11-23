@@ -46,6 +46,42 @@ final class RecorderSession: ObservableObject {
     @Published private(set) var recordingElapsed: Int = 0
     /// 合成进度用的已写帧数
     @Published private(set) var recordedFrameCount: Int = 0
+    /// 传输/合成失败后能否直接重试（眼镜上的 mp4 还在，不必重录一遍）
+    @Published private(set) var canRetryTransfer = false
+
+    /// 传输失败后重试：本地已有完整文件就直接合成，否则重新拉。
+    /// 这条链路 0.2~0.4MB/s，传 14MB 要 40~70 秒，一次抖动就让人重录 60 秒太亏了。
+    func retryTransfer() {
+        guard !isRunning, let adb = adb,
+              let screenURL = screenLocalURL,
+              let cameraURL = cameraLocalURL,
+              let outputURL = outputLocalURL else { return }
+        recordError = nil
+        finishedMovieURL = nil
+        canRetryTransfer = false
+        offlineProgress = 0
+
+        let fm = FileManager.default
+        func size(_ url: URL) -> Int {
+            ((try? fm.attributesOfItem(atPath: url.path))?[.size] as? Int) ?? 0
+        }
+        let haveScreen = size(screenURL) > 0
+        let haveCamera = size(cameraURL) > 0
+
+        if haveScreen && haveCamera {
+            append("重试：两个 mp4 本地已完整，直接重新合成")
+            setPhase(.composing, "重新离线合成…")
+            readTrackMetas(adb: adb) { [weak self] sMeta, cMeta in
+                guard let self = self else { return }
+                self.composeOffline(screenURL: screenURL, cameraURL: cameraURL,
+                                    outputURL: outputURL,
+                                    screenMeta: sMeta, cameraMeta: cMeta)
+            }
+        } else {
+            append("重试：重新拉取 mp4（眼镜上的文件还在）")
+            pullFiles(adb: adb)
+        }
+    }
 
     func clearRecordResult() {
         finishedMovieURL = nil
@@ -53,6 +89,7 @@ final class RecorderSession: ObservableObject {
         offlineProgress = 0
         phaseDetail = ""
         recordedFrameCount = 0
+        canRetryTransfer = false
     }
 
     func appendUser(_ line: String) { append(line) }
@@ -493,6 +530,12 @@ final class RecorderSession: ObservableObject {
             self.offlinePhase = .idle
             self.offlineProgress = 0
             self.recordError = message
+            // 只要已经录完、本地路径都建好了，就允许「重试传输」——
+            // 传输失败时眼镜上的 mp4 还在（删文件的命令只在两路都拉成功后才发）。
+            self.canRetryTransfer = self.adb != nil
+                && self.screenLocalURL != nil
+                && self.cameraLocalURL != nil
+                && self.outputLocalURL != nil
             self.append(message)
         }
     }

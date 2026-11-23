@@ -307,6 +307,10 @@ struct ContentView: View {
             SaveDoneSheet(movieURL: session.finishedMovieURL,
                           errorMessage: session.recordError,
                           onPlay: { openPhotos() },
+                          onRetry: session.canRetryTransfer ? {
+                showSaveDone = false
+                session.retryTransfer()
+            } : nil,
                           onClose: {
                 showSaveDone = false
                 session.clearRecordResult()

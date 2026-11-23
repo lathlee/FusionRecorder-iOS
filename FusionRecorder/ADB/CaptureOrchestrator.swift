@@ -111,6 +111,10 @@ final class CaptureOrchestrator: ObservableObject {
     }
 
     /// 相机流：App uid 的前台服务本地录 mp4。
+    ///
+    /// 保持 30fps：曾想降到 20fps（成片只输出 20fps，看起来多出的帧是浪费），
+    /// 但眼镜上实测 20 秒录制 —— 30fps 出 3.02MB，20fps 出 3.84MB，反而更大。
+    /// VBR 在帧数变少时把更多码率分给每一帧，体积不降反升。别动。
     static func cameraRecordStartCommand(path: String = cameraMP4Path,
                                          width: Int = 640, height: Int = 480,
                                          fps: Int = 30, bitrate: Int = 2_000_000,

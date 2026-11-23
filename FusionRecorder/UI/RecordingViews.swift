@@ -123,6 +123,8 @@ struct SaveDoneSheet: View {
     var movieURL: URL?
     var errorMessage: String?
     var onPlay: () -> Void
+    /// 传输/合成失败时提供「重试」：眼镜上的 mp4 还在，不用重录一遍
+    var onRetry: (() -> Void)? = nil
     var onClose: () -> Void
 
     private var isSuccess: Bool { movieURL != nil }
@@ -144,6 +146,21 @@ struct SaveDoneSheet: View {
                 Text("常见原因：眼镜端 mp4 没写完、ADB pull 失败、或两个视频没有可对齐的帧。可看主界面日志排查。")
                     .font(.system(size: 12))
                     .foregroundStyle(Palette.secondary)
+
+                if let onRetry = onRetry {
+                    Button(action: onRetry) {
+                        Text("重试传输并合成")
+                            .font(.system(size: 16))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 8)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(Palette.accent)
+                    .padding(.top, 10)
+                    Text("录制文件还在眼镜上，重试不用重新录。")
+                        .font(.system(size: 12))
+                        .foregroundStyle(Palette.secondary)
+                }
             }
 
             if isSuccess {
