@@ -146,8 +146,11 @@ final class GlassesDiscovery {
     func interfaceDump() -> String {
         let all = localIPv4()
         if all.isEmpty { return "无（连 127.0.0.1 都没有，异常）" }
-        return all.map { ip in
-            "\\(ip)\\(Self.isPrivateIPv4(ip) ? "" : "（非局域网）")"
+        return all.map { ip -> String in
+            // 别在插值里嵌三元字符串：`"\(a ? "" : "x")"` 这种写法会把字面量提前截断，
+            // 编译期报「consecutive statements on a line must be separated by ';'」。
+            let tag = Self.isPrivateIPv4(ip) ? "" : "（非局域网）"
+            return ip + tag
         }.joined(separator: " , ")
     }
 
