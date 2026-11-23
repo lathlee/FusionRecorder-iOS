@@ -1047,10 +1047,12 @@ struct ContentView: View {
         autoBusy = true
         session.clearRecordResult()
         session.update(params: fusionParams)
-        // 已经连上就用当前地址；没连上就传 nil 让编排器自己扫（传旧 IP 只会白等超时）
-        let target = orchestrator.glassesIP
+        // 已连上：直接用当前地址（编排器会复用那条连接）。
+        // 没连上：host 传 nil + 候选地址，让编排器扫 —— 传死 IP 只会白等 40 秒超时。
+        let target = orchestrator.isConnected ? orchestrator.glassesIP : nil
         session.appendUser("点「开始录制」：开始走离线链路（部署 → 眼镜本地录制）")
         session.startAuto(host: target,
+                          candidates: knownCandidates,
                           iphoneHostIP: nil,
                           screenPort: UInt16(screenPort) ?? 9114,
                           cameraPort: UInt16(cameraPort) ?? 9115) { [self] result in

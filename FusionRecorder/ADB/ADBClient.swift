@@ -56,6 +56,8 @@ final class ADBClient {
         init(_ service: String) { self.service = service }
     }
 
+    /// 连的是哪个地址（接管已有连接时要把 IP 一起带过去，界面才知道连的是谁）
+    let host: String
     private let connection: NWConnection
     private let queue = DispatchQueue(label: "com.lath.fusionrecorder.adb")
     private var buffer = Data()
@@ -72,6 +74,7 @@ final class ADBClient {
     private var watchdog: DispatchSourceTimer?
 
     init(host: String, port: UInt16 = 5555) {
+        self.host = host
         let nwPort = NWEndpoint.Port(rawValue: port) ?? NWEndpoint.Port(rawValue: 5555)!
         let endpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(host), port: nwPort)
         connection = NWConnection(to: endpoint, using: .tcp)

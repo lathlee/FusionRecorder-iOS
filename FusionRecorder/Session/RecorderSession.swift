@@ -163,13 +163,18 @@ final class RecorderSession: ObservableObject {
     }
 
     /// 全自动入口：部署 → 本地录制 → 计时。端口参数保留兼容，离线不使用。
-    func startAuto(host: String? = nil, iphoneHostIP: String? = nil,
+    ///
+    /// candidates：界面已知的眼镜地址（手填的、上次成功的、热点常见地址）。
+    /// 0.5.7 把 host 传成 nil 后，扫描只用自己的记忆地址，结果「预览能连、录制未发现」，
+    /// 所以这里必须把候选一起带下去。
+    func startAuto(host: String? = nil, candidates: [String] = [], iphoneHostIP: String? = nil,
                    screenPort: UInt16 = 9114, cameraPort: UInt16 = 9115,
                    completion: @escaping (Result<Void, Error>) -> Void) {
-        startOffline(host: host, iphoneHostIP: iphoneHostIP, completion: completion)
+        startOffline(host: host, candidates: candidates, iphoneHostIP: iphoneHostIP,
+                     completion: completion)
     }
 
-    private func startOffline(host: String?, iphoneHostIP: String?,
+    private func startOffline(host: String?, candidates: [String] = [], iphoneHostIP: String?,
                               completion: @escaping (Result<Void, Error>) -> Void) {
         // 只有真正在录/在收尾时才拒绝。.deploying 允许重入 ——
         // 上一次部署中途失败会把状态卡在 deploying，老逻辑会永久挡住「开始录制」，
@@ -184,7 +189,8 @@ final class RecorderSession: ObservableObject {
         clearRecordResult()
         setPhase(.deploying, "离线架构：部署采集端（眼镜本地录两路 mp4）")
 
-        orchestrator.run(host: host, iphoneHostIP: iphoneHostIP) { [weak self] result in
+        orchestrator.run(host: host, iphoneHostIP: iphoneHostIP,
+                         extraCandidates: candidates) { [weak self] result in
             guard let self = self else { return }
             switch result {
             case .failure(let error):
@@ -824,6 +830,10 @@ final class RecorderSession: ObservableObject {
                 GlassesDiscovery.shared.remember(address)
                 self.previewAdb = client
                 self.append("预览连接已建立（\(address)）")
+                // ★ 0.5.8：把这条连接交给编排器复用。
+                // 否则会出现「预览能抓画面、点录制却说未发现眼镜」——
+                // 录制那条路重新扫端口，扫不到就判定没找到，明明链路是通的。
+                self.orchestrator.adopt(client, ip: address)
                 completion(.success(client))
             }
         }

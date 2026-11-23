@@ -313,6 +313,17 @@ final class CaptureOrchestrator: ObservableObject {
             GlassesDiscovery.shared.scan(extra: extras) { [weak self] result in
                 guard let self = self else { return }
                 guard let found = result else {
+                    // ★ 0.5.8 兜底：端口探测只是「能不能连上 5555」的快速判断，
+                    // 它失败不代表 ADB 不通（真机上出现过预览能连、扫描却全空）。
+                    // 有记忆地址就直接走一次真实握手，让错误信息变成真正的原因。
+                    let remembered = GlassesDiscovery.shared.lastIP
+                    let fallback = remembered ?? extras.first
+                    if let candidate = fallback, !candidate.isEmpty {
+                        self.append("端口扫描没命中，改用记住的地址直接握手：\(candidate)")
+                        self.glassesIP = candidate
+                        deploy(to: candidate)
+                        return
+                    }
                     // 别只丢一句「未发现」——把「怎么救」写清楚。
                     // 0.5.6：这里以前写着「去 设置 → 本地网络 打开融合录屏」，
                     // 可那个开关根本不存在（App 从没主动访问过局域网，系统也就没建这项），
@@ -342,6 +353,15 @@ final class CaptureOrchestrator: ObservableObject {
                                   completion: @escaping (Result<String, Error>) -> Void) {
         // 离线架构下 host 可以为空（眼镜不外连），只是日志里少一行
         let phoneIP = iphoneIP ?? ""
+
+        // ★ 0.5.8：已经有一条连着同一个地址的连接就直接复用。
+        // 真机上「预览能抓画面、录制却未发现眼镜」就是因为录制这条路
+        // 从头另连一条，而扫描又没命中 —— 明明手上就有可用连接。
+        if let existing = adb, isConnected, existing.host == glassesIP {
+            append("复用已有连接 \(glassesIP)，跳过重复握手")
+            verifyShell(client: existing, phoneIP: phoneIP, completion: completion)
+            return
+        }
 
         let client = ADBClient(host: glassesIP, port: 5555)
         client.log = { [weak self] message in self?.append("[ADB] \(message)") }
@@ -602,6 +622,27 @@ final class CaptureOrchestrator: ObservableObject {
                 }
             }
         }
+    }
+
+    // MARK: - 接管已有连接
+
+    /// 接管一条**已经握手成功**的连接（目前来自「刷新预览」）。
+    ///
+    /// 为什么需要：真机上出现过「预览能抓到画面，点开始录制却提示未发现眼镜」——
+    /// 预览自己连了一条 ADB，但编排器毫不知情，录制时又去扫端口，
+    /// 扫不到就报「未发现眼镜」。明明链路是通的，却让人以为 IP 不对。
+    /// 接管之后：界面状态、之后的部署、心跳都复用这一条，不再重新扫。
+    func adopt(_ client: ADBClient, ip: String) {
+        guard adb == nil, !isConnected else { return }
+        adb = client
+        client.onLinkLost = { [weak self] in self?.handleLinkLost() }
+        glassesIP = ip
+        GlassesDiscovery.shared.remember(ip)
+        isConnected = true
+        linkLost = false
+        setStage(.ready, "已连接 \(ip)（复用预览通道）")
+        startHeartbeat()
+        fetchDeviceInfo(client: client) { }
     }
 
     // MARK: - 链路存活 / 掉线重找

@@ -98,8 +98,20 @@ settings:
     #                 ④ 断链感知：ADBClient 新增 onLinkLost，CaptureOrchestrator 每 6 秒
     #                    echo 一次心跳，连续两次失败就判掉线 → 胶囊变「已断开」、清预览、
     #                    自动重找一次（找新 IP 后自动回写并重连）。
-    MARKETING_VERSION: "0.5.7"
-    CURRENT_PROJECT_VERSION: "29"
+    #         0.5.8 = 「预览能抓画面、录制却报未发现眼镜」：
+    #                 ① 预览自己连了一条 ADB，编排器毫不知情 → 录制又去扫端口，
+    #                    扫不到就判定「未发现眼镜」，明明链路是通的。
+    #                    现在预览成功后把这条连接交给编排器接管（adopt），
+    #                    界面变「已就绪」、并顺手读出型号；
+    #                 ② 0.5.7 把「开始录制」的 host 传成 nil，候选地址也没带下去
+    #                    → 扫描只能靠记忆地址，命中不了就失败。现在把候选一起传；
+    #                 ③ 端口探测 0.45s 对已知地址太紧（真机上一个都没命中），
+    #                    已知地址给 1.5s、盲扫给 0.6s；
+    #                 ④ 扫描真的没命中时，用记忆地址直接走一次真实 ADB 握手，
+    #                    报出的就是真正的原因，而不是一句「未发现眼镜」；
+    #                 ⑤ 已有一条连着同一地址的连接时直接复用，不再重复握手。
+    MARKETING_VERSION: "0.5.8"
+    CURRENT_PROJECT_VERSION: "30"
     # 侧载不需要 Apple 签名，签名交给 SideStore / AltStore 用免费 Apple ID 做
     CODE_SIGNING_ALLOWED: "NO"
     CODE_SIGNING_REQUIRED: "NO"

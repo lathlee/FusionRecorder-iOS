@@ -308,7 +308,12 @@ final class GlassesDiscovery {
             group.enter()
             pool.async {
                 defer { group.leave() }
-                let reachable = self.probe(ip: ip, port: self.adbPort, timeout: 0.45)
+                // ★ 0.5.8：已知地址给更长的超时。
+                // 真机上出现过「预览能连上这个 IP，扫描却一个都没命中」——
+                // 0.45 秒对一次要走 VPN/隧道的 TCP 握手指令来说太紧了。
+                let known = (ip == self.lastIP) || extra.contains(ip)
+                let reachable = self.probe(ip: ip, port: self.adbPort,
+                                           timeout: known ? 1.5 : 0.6)
                 lock.lock()
                 probed += 1
                 let done = finished
