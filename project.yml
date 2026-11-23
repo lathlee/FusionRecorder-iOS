@@ -64,8 +64,15 @@ settings:
     #                 ③ 刷新预览的相机快照补 180°（此前判断「JPEG 已是正的」是错的）；
     #                 ④ 界面按深色卡片风格重做（渐变底/卡片分层/状态胶囊/分组图标）；
     #                 ⑤ 取不到本机局域网 IP 不再阻断部署（离线架构眼镜不外连）
-    MARKETING_VERSION: "0.5.3"
-    CURRENT_PROJECT_VERSION: "25"
+    #         0.5.4 = ★ 修「连不上眼镜、又从不弹授权框」的真根因：
+    #                 AUTH RSAPUBLICKEY 之前发的是 base64(SPKI DER)，而 adb 协议要的是
+    #                 它自家 524 字节 RSAPublicKey 结构（len/n0inv/n/rr/exponent，小端）。
+    #                 这副眼镜收到合法公钥会静默接受、收到解析不了的就不吭声 ——
+    #                 于是既不弹框也不回 CNXN，表现为「永远正在连接」。
+    #                 现在自己算 n0inv（32 位牛顿迭代）与 rr（2^4096 mod n），
+    #                 算法已与 adb 生成的 adbkey.pub 逐字节对拍通过。
+    MARKETING_VERSION: "0.5.4"
+    CURRENT_PROJECT_VERSION: "26"
     # 侧载不需要 Apple 签名，签名交给 SideStore / AltStore 用免费 Apple ID 做
     CODE_SIGNING_ALLOWED: "NO"
     CODE_SIGNING_REQUIRED: "NO"

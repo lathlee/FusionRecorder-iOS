@@ -309,13 +309,16 @@ final class CaptureOrchestrator: ObservableObject {
         let client = ADBClient(host: glassesIP, port: 5555)
         client.log = { [weak self] message in self?.append("[ADB] \(message)") }
         adb = client
-        setStage(.connecting, "CNXN / AUTH 握手（首次需在眼镜上点允许调试）")
+        setStage(.connecting, "CNXN / AUTH 握手")
+        // 打出发公钥用的格式：这副眼镜**不会弹授权框**，它只认合法格式的公钥并静默接受，
+        // 所以「握手卡住」几乎一定是格式问题。这行日志用来一眼确认。
+        append("公钥格式：\(ADBAuth.shared.publicKeySummary)")
 
         client.connect { [weak self] result in
             guard let self = self else { return }
             switch result {
             case .failure(let error):
-                self.finishFailure("ADB 连接失败：\(error.localizedDescription)（首次授权请在眼镜上确认弹框）", completion: completion)
+                self.finishFailure("ADB 连接失败：\(error.localizedDescription)（看部署日志里「公钥格式」那行）", completion: completion)
                 return
             case .success:
                 self.append("ADB 已授权并握手完成，指纹 \(ADBAuth.shared.fingerprint)")

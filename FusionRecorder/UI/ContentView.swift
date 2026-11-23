@@ -359,7 +359,7 @@ struct ContentView: View {
 
     private var placeholderDetail: String {
         if orchestrator.isBusy {
-            return "首次连接要在眼镜屏幕上点「允许 USB 调试」"
+            return "点「连接眼镜」开始握手（这副眼镜不会弹授权框）"
         }
         if orchestrator.stage == .failed {
             return orchestrator.stageDetail.isEmpty ? "点下方重试连接" : orchestrator.stageDetail

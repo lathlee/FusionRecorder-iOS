@@ -98,14 +98,14 @@ final class ADBClient {
         // 12 秒还没握手完 → 先把「去眼镜上点允许」喊出来（不判失败，只提示）
         queue.asyncAfter(deadline: .now() + 12) { [weak self] in
             guard let self = self, !self.isReady else { return }
-            self.log?("还在等设备应答：现在**戴上眼镜亮屏**，看到「允许 USB 调试吗」就点允许并勾选始终允许")
+            self.log?("还在等设备应答：确认眼镜已亮屏、无线 ADB（service.adb.tcp.port=5555）在监听")
         }
         // 超时才算失败，让流程能收尾、能重试，而不是无限转圈
         queue.asyncAfter(deadline: .now() + Self.handshakeTimeout) { [weak self] in
             guard let self = self, !self.isReady else { return }
             self.log?("握手超时 \(Int(Self.handshakeTimeout))s：未收到 CNXN")
             self.failAll(ADBError.connectionFailed(
-                "握手超时：请点亮眼镜，在屏幕上点「允许 USB 调试」（勾选始终允许）后重试"))
+                "握手超时：眼镜没回 CNXN。确认眼镜亮屏、5555 在监听，再点「重新扫描」"))
         }
     }
 
