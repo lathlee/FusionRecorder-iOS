@@ -214,7 +214,12 @@ final class CaptureOrchestrator: ObservableObject {
 
     /// 屏幕截图：shell 的 screencap 直接落 PNG，几十 KB，比拉视频快两个数量级。
     static func screenSnapshotCommand() -> String {
-        "screencap -p \(screenSnapshotPath) >/dev/null 2>&1; chmod 644 \(screenSnapshotPath); "
+        // ★ 0.5.9：先唤醒屏幕再截图。
+        // 录制那条路（prepareRecordCommand）本来就带 KEYCODE_WAKEUP，
+        // 预览这条路没有 —— 眼镜息屏时 screencap 直接没有有效帧，
+        // 表现就是「能录制、抓不到预览」。
+        "input keyevent KEYCODE_WAKEUP >/dev/null 2>&1; sleep 0.4; "
+            + "screencap -p \(screenSnapshotPath) >/dev/null 2>&1; chmod 644 \(screenSnapshotPath); "
             + "ls -l \(screenSnapshotPath) 2>/dev/null | awk '{print $5}'"
     }
 
@@ -302,8 +307,11 @@ final class CaptureOrchestrator: ObservableObject {
         GlassesDiscovery.shared.requestLocalNetworkPermission()
 
         if let given = host, !given.isEmpty {
-            glassesIP = given
-            append("使用指定眼镜 IP：\(given)")
+            // ★ 0.5.9：这里只记日志，不写 glassesIP。
+            // 「指定了地址」不等于「找到了眼镜」—— 只有 ADB 握手成功才算数
+            // （见 connectAndDeploy 的 success 分支）。以前先赋值，
+            // 结果是连不上的地址也会被界面当成「眼镜 IP」，还会回写输入框。
+            append("探测指定地址：\(given)")
             deploy(to: given)
         } else {
             let extras = extraCandidates.filter { !$0.isEmpty }
@@ -320,7 +328,6 @@ final class CaptureOrchestrator: ObservableObject {
                     let fallback = remembered ?? extras.first
                     if let candidate = fallback, !candidate.isEmpty {
                         self.append("端口扫描没命中，改用记住的地址直接握手：\(candidate)")
-                        self.glassesIP = candidate
                         deploy(to: candidate)
                         return
                     }
@@ -335,8 +342,7 @@ final class CaptureOrchestrator: ObservableObject {
                     self.finishFailure(hint, completion: completion)
                     return
                 }
-                self.glassesIP = found.ip
-                self.append("发现眼镜 \(found.ip)（\(found.source)）")
+                self.append("端口可达：\(found.ip)（\(found.source)），接着做 ADB 握手确认身份")
                 deploy(to: found.ip)
             }
         }
@@ -381,6 +387,12 @@ final class CaptureOrchestrator: ObservableObject {
                 return
             case .success:
                 self.append("ADB 已授权并握手完成，指纹 \(ADBAuth.shared.fingerprint)")
+                // ★ 0.5.9：握手成功才认这个地址是「眼镜 IP」。
+                // 之前的顺序是「扫到/指定了就写进 glassesIP」，连不上的地址也会被
+                // 界面当成眼镜、还会回写输入框 —— 表现就是「IP 老是跳成不对的那个」。
+                self.glassesIP = glassesIP
+                GlassesDiscovery.shared.remember(glassesIP)
+                self.append("确认眼镜地址：\(glassesIP)（已记住，下次优先用它）")
                 DispatchQueue.main.async {
                     self.isConnected = true
                     self.linkLost = false

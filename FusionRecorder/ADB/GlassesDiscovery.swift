@@ -265,13 +265,18 @@ final class GlassesDiscovery {
             if !ordered.contains(ip) { ordered.append(ip) }
         }
         if let last = lastIP, !ordered.contains(last) { ordered.append(last) }
-        // iOS 热点的网段固定是 172.20.10.0/28（可用 .1~.14），一共就 13 个地址。
-        // 0.5.7：整段都探一遍 —— 真机上「本机 IP」经常读不到本机局域网接口
-        // （只剩 VPN 的 utun），那样就拼不出 /24，切到热点后永远找不到眼镜。
-        // 这一段不依赖本机地址，14 次探测摊到并发池里几乎不花钱。
-        for host in 2...14 {
-            let ip = "172.20.10.\(host)"
-            if !ordered.contains(ip) { ordered.append(ip) }
+        // iOS 热点的网段固定是 172.20.10.0/28（可用 .1~.14）。
+        //
+        // ★ 0.5.9：**只有本机真的在热点网段上**（或上次就成功连过 172.20.10.x）才探这一段。
+        // 0.5.7 是无条件探的，结果普通 WiFi 下也去连 172.20.10.x，
+        // 扫到就把眼镜 IP 改成 172 段 —— 用户看到的「老是自动跳回 172」就是这么来的。
+        let hotspotContext = localIPv4().contains { $0.hasPrefix("172.20.10.") }
+            || (lastIP?.hasPrefix("172.20.10.") ?? false)
+        if hotspotContext {
+            for host in 2...14 {
+                let ip = "172.20.10.\(host)"
+                if !ordered.contains(ip) { ordered.append(ip) }
+            }
         }
         for local in localIPv4() {
             let parts = local.split(separator: ".").compactMap { Int($0) }

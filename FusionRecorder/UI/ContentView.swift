@@ -54,6 +54,10 @@ struct ContentView: View {
 
     // iPhone 端连接（交接包 §5：POC_PC_IP / POC_SCREEN_PORT / POC_CAM_PORT）
     @AppStorage("host") private var host = "192.168.101.133"
+    /// 用户在「连接参数」里手改过眼镜 IP 就锁住：扫描结果不许再覆盖它。
+    /// 真机上出现过「手动改成 192.168.137.158，过一会儿又跳回 172 段」——
+    /// 自动扫描命中了别的地址，把用户填的值冲掉了。
+    @AppStorage("hostManual") private var hostManual = false
     @AppStorage("screenPort") private var screenPort = "9114"
     @AppStorage("cameraPort") private var cameraPort = "9115"
 
@@ -186,6 +190,7 @@ struct ContentView: View {
             // 权限框是异步的，给它 1.5 秒再读一次接口地址
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { refreshLanIP() }
             DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) { refreshLanIP() }
+            autoPreviewIfNeeded()
         }
         .onChange(of: fusionParams) { newValue in
             session.update(params: newValue)
@@ -198,9 +203,9 @@ struct ContentView: View {
             }
         }
         .onChange(of: orchestrator.glassesIP) { newValue in
-            // 眼镜换地址了（WiFi ↔ 热点）就把新地址写回去，
-            // 否则 host 还是旧值，预览/录制会拿着废地址去连。
-            if let ip = newValue, !ip.isEmpty, ip != host { host = ip }
+            // 只有用户没手填过，才允许把扫描到的地址写回输入框。
+            // 手填过就锁住 —— 否则「手动改了也会跳回去」。
+            if !hostManual, let ip = newValue, !ip.isEmpty, ip != host { host = ip }
             refreshLanIP()
         }
         // 掉线：清预览 + 让界面马上改成「已断开」，不等人去点任何按钮
@@ -214,6 +219,9 @@ struct ContentView: View {
         .onChange(of: orchestrator.isConnected) { connected in
             if !connected { frames.clear() }
             refreshLanIP()
+            // ★ 0.5.9：连上就自动抓一帧。以前连上之后仍停在
+            // 「尚未连接眼镜 / 点连接眼镜」，用户得自己想到去点「刷新预览」。
+            if connected { autoPreviewIfNeeded() }
         }
         .onChange(of: session.finishedMovieURL) { url in
             if url != nil { showSaveDone = true }
@@ -367,8 +375,8 @@ struct ContentView: View {
                     .padding(.horizontal, 26)
 
                 if !orchestrator.isBusy {
-                    Button(action: autoDeploy) {
-                        Text(orchestrator.stage == .failed ? "重试连接" : "连接眼镜")
+                    Button(action: placeholderAction) {
+                        Text(placeholderActionTitle)
                             .font(.system(size: 12.5, weight: .semibold))
                             .foregroundStyle(.white)
                             .padding(.horizontal, 18)
@@ -384,9 +392,23 @@ struct ContentView: View {
         }
     }
 
+    /// 占位区的按钮得跟着状态变：连上了还写「连接眼镜」只会让人再点一次。
+    private var placeholderActionTitle: String {
+        if orchestrator.stage == .failed { return "重试连接" }
+        if orchestrator.isConnected { return "立即抓取画面" }
+        return "连接眼镜"
+    }
+
+    private func placeholderAction() {
+        if orchestrator.isConnected { refreshPreview() } else { autoDeploy() }
+    }
+
     private var placeholderTitle: String {
         if orchestrator.isBusy { return "正在连接眼镜…" }
         if orchestrator.stage == .failed { return "连接失败" }
+        if orchestrator.isConnected {
+            return session.previewBusy ? "正在抓取画面…" : "已连接，等待画面"
+        }
         return "尚未连接眼镜"
     }
 
@@ -397,10 +419,14 @@ struct ContentView: View {
         if orchestrator.stage == .failed {
             return orchestrator.stageDetail.isEmpty ? "点下方重试连接" : orchestrator.stageDetail
         }
-        if lanIP.isEmpty {
-            return "点「连接眼镜」——眼镜 IP 已预填，会直连试一次\n（这副眼镜不弹 USB 授权框，也不需要本机 IP）"
+        if orchestrator.isConnected {
+            // ★ 0.5.9：连上就自动抓一帧，这里只说明正在做什么，
+            // 不再让用户对着「尚未连接眼镜」自己找按钮。
+            return "已连上 \(connectionIP)，正在自动抓取一帧真实画面\n"
+                + "抓不到就点「刷新预览」，失败原因会显示在按钮下面"
         }
-        return "连接后点「刷新预览」抓一帧真实画面\n没抓过帧就不显示旧画面"
+        return "点「连接眼镜」——眼镜 IP 已预填，会直连试一次\n"
+            + "（这副眼镜不弹 USB 授权框，也不需要本机 IP）"
     }
 
     // MARK: - 三颗主按钮
@@ -438,11 +464,23 @@ struct ContentView: View {
             }
 
             if !session.previewNote.isEmpty {
-                Text(session.previewNote)
-                    .font(.system(size: 11))
-                    .foregroundStyle(Palette.secondary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 2)
+                // ★ 0.5.9：失败信息以前和「已抓取…」一个灰色，扫一眼根本看不出出错。
+                // 现在失败/半失败用警告色，并且允许换行（原来被压成一行截断）。
+                let failed = session.previewNote.hasPrefix("刷新失败")
+                    || session.previewNote.hasPrefix("只抓到")
+                HStack(alignment: .top, spacing: 6) {
+                    Image(systemName: failed ? "exclamationmark.triangle.fill" : "info.circle")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(failed ? Palette.warn : Palette.secondary)
+                        .padding(.top, 1)
+                    Text(session.previewNote)
+                        .font(.system(size: 11))
+                        .foregroundStyle(failed ? Palette.warn : Palette.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 0)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 2)
             }
         }
     }
@@ -772,24 +810,24 @@ struct ContentView: View {
             // ---- 连接参数 ----
             blockCard("连接参数", icon: "network") {
                 VStack(spacing: 9) {
-                    Text("眼镜无线 ADB 默认 5555。换网络（WiFi ↔ 热点）后眼镜 IP 会变，"
-                        + "点「重新扫描」会自动找；找不到就在这里填。")
+                    Text("眼镜无线 ADB 默认 5555。手改过的 IP 会被锁住，自动扫描不会覆盖它。")
                         .font(.system(size: 10.5))
                         .foregroundStyle(Palette.hint)
                         .fixedSize(horizontal: false, vertical: true)
-                    fieldRow("眼镜 IP", text: $host, decimal: true)
+                    fieldRow("眼镜 IP", text: hostBinding, decimal: true)
                     HStack(spacing: 8) {
-                        Button("恢复默认 IP") {
-                            host = Self.defaultHost
-                            session.appendUser("眼镜 IP 已恢复默认 \(Self.defaultHost)")
+                        Button("恢复自动") {
+                            hostManual = false
+                            host = orchestrator.glassesIP ?? Self.defaultHost
+                            session.appendUser("眼镜 IP 改回自动（当前 \(host)）")
                         }
                         .font(.system(size: 11.5, weight: .medium))
                         .foregroundStyle(Palette.accent)
                         .buttonStyle(.plain)
                         Spacer()
-                        Text("当前 \(orchestrator.glassesIP ?? "未连接")")
-                            .font(.system(size: 10.5, design: .monospaced))
-                            .foregroundStyle(Palette.hint)
+                        Text(hostManual ? "已锁定（手动）" : "自动")
+                            .font(.system(size: 10.5, weight: .medium))
+                            .foregroundStyle(hostManual ? Palette.warn : Palette.hint)
                     }
                     fieldRow("屏幕流端口", text: $screenPort, decimal: false)
                     fieldRow("相机流端口", text: $cameraPort, decimal: false)
@@ -892,6 +930,27 @@ struct ContentView: View {
         .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
     }
 
+    /// 手改即锁定：只有经过这个 Binding 的写入才算「用户改的」，
+    /// 代码里直接 `host = ip` 不经过它，所以自动扫描不会把锁打开。
+    private var hostBinding: Binding<String> {
+        Binding(
+            get: { host },
+            set: { newValue in
+                host = newValue
+                let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
+                hostManual = Self.isIPv4(trimmed)     // 输入中间态（如 "192.168.1"）先不锁
+            }
+        )
+    }
+
+    static func isIPv4(_ text: String) -> Bool {
+        let parts = text.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count == 4 else { return false }
+        return parts.allSatisfy { part in
+            !part.isEmpty && Int(part).map { $0 >= 0 && $0 <= 255 } == true
+        }
+    }
+
     private func fieldRow(_ title: String, text: Binding<String>, decimal: Bool) -> some View {
         VStack(alignment: .leading, spacing: 5) {
             Text(title)
@@ -944,8 +1003,15 @@ struct ContentView: View {
     private var knownCandidates: [String] {
         var list: [String] = []
         let typed = host.trimmingCharacters(in: .whitespacesAndNewlines)
-        for ip in [typed, Self.defaultHost, GlassesDiscovery.hotspotGlassesIP] where !ip.isEmpty {
+        for ip in [typed, Self.defaultHost] where !ip.isEmpty {
             if !list.contains(ip) { list.append(ip) }
+        }
+        // 热点地址只在真的可能用到时才加（本机在 172.20.10.x 上，或上次就是热点连的），
+        // 否则普通 WiFi 下也会去探 172 段，扫到就把 IP 改成 172 —— 用户说的「跳回 172」。
+        let hotspotContext = lanIP.hasPrefix("172.20.10.")
+            || (GlassesDiscovery.shared.lastIP?.hasPrefix("172.20.10.") ?? false)
+        if hotspotContext, !list.contains(GlassesDiscovery.hotspotGlassesIP) {
+            list.append(GlassesDiscovery.hotspotGlassesIP)
         }
         return list
     }
@@ -961,6 +1027,21 @@ struct ContentView: View {
     /// 这副眼镜的地址（DHCP 长期稳定在 .133）。留作「重新扫描」的兜底，
     /// 也方便手滑清空后一键恢复。
     private static let defaultHost = "192.168.101.133"
+
+    /// 连上之后自动抓一帧（用户不必自己去找「刷新预览」）。
+    /// 只在还没有画面、没在录制、没在抓的时候触发一次，避免反复重试。
+    private func autoPreviewIfNeeded() {
+        guard !frames.hasFrames, !session.isRunning, !session.previewBusy,
+              session.offlinePhase == .idle else { return }
+        // 给 ADB 握手/部署收尾留一点时间，别刚 ready 就抢着发命令
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+            guard orchestrator.isConnected, !frames.hasFrames,
+                  !session.isRunning, !session.previewBusy,
+                  session.offlinePhase == .idle else { return }
+            session.appendUser("已连上眼镜，自动抓一帧画面…")
+            refreshPreview()
+        }
+    }
 
     /// 刷新预览：抓屏幕上真实的一帧 + 相机拍一张，合成后立刻显示。
     private func refreshPreview() {
