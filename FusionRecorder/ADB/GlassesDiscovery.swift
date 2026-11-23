@@ -206,10 +206,10 @@ final class GlassesDiscovery {
         guard permissionBrowser == nil else { return }
         let params = NWParameters.tcp
         params.includePeerToPeer = true
-        let browser = NWBrowser(for: .bonjour(service: "_adb-tls-connect._tcp", domain: nil),
+        let browser = NWBrowser(for: .bonjour(type: "_adb-tls-connect._tcp", domain: nil),
                                 using: params)
         permissionBrowser = browser
-        browser.stateUpdateHandler = { [weak self] state in
+        browser.stateUpdateHandler = { [weak self] (state: NWBrowser.State) in
             switch state {
             case .ready:
                 NSLog("[Discovery] Bonjour 就绪：本地网络权限已放行")
@@ -221,7 +221,8 @@ final class GlassesDiscovery {
                 break
             }
         }
-        browser.browseResultsChangedHandler = { results, _ in
+        browser.browseResultsChangedHandler = {
+            (results: Set<NWBrowser.Result>, _: Set<NWBrowser.Result.Change>) in
             for result in results {
                 NSLog("[Discovery] Bonjour 服务：\(result.endpoint)")
             }
