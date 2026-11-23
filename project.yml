@@ -87,8 +87,19 @@ settings:
     #                    让系统真的弹一次框，并需在 Info.plist 声明 NSBonjourServices；
     #                 ③ 已连上时不再报警；离线架构下本机 IP 取不到只显示「不影响录制」；
     #                 ④ 本机接口日志改成带接口名（en0 / utun3），一眼看出是不是只剩 VPN。
-    MARKETING_VERSION: "0.5.6"
-    CURRENT_PROJECT_VERSION: "28"
+    #         0.5.7 = 「IP / 状态」这一组的收尾：
+    #                 ① 界面上的「本机 16.2.0.0」其实是 VPN 虚拟网卡，显示它纯属误导
+    #                    —— 现在只显示 RFC1918 私有地址，没有就写「眼镜直连·无需本机 IP」；
+    #                 ② 删掉「iPhone IP」输入框（离线架构根本不用它，填了只会让人以为
+    #                    填错就是连不上的原因）；
+    #                 ③ 「重新扫描」以前只是拿手填/存着的 IP 直连，根本没扫 ——
+    #                    换网络后点它永远找不到。现在真的扫：候选先探，再扫本机 /24；
+    #                    「连接眼镜」也走同一条路径，填错的 IP 不再阻断。
+    #                 ④ 断链感知：ADBClient 新增 onLinkLost，CaptureOrchestrator 每 6 秒
+    #                    echo 一次心跳，连续两次失败就判掉线 → 胶囊变「已断开」、清预览、
+    #                    自动重找一次（找新 IP 后自动回写并重连）。
+    MARKETING_VERSION: "0.5.7"
+    CURRENT_PROJECT_VERSION: "29"
     # 侧载不需要 Apple 签名，签名交给 SideStore / AltStore 用免费 Apple ID 做
     CODE_SIGNING_ALLOWED: "NO"
     CODE_SIGNING_REQUIRED: "NO"

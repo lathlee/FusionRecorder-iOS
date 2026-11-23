@@ -33,6 +33,10 @@ final class ADBClient {
     /// 日志回传（UI 侧负责切主线程）
     var log: ((String) -> Void)?
 
+    /// 握手成功之后链路断了（眼镜睡了 / 换了 WiFi / IP 变了）。
+    /// 只在「曾经 ready 过」且不是我们主动关的时候回调一次。
+    var onLinkLost: (() -> Void)?
+
     private final class Stream {
         let service: String
         var remoteId: UInt32?
@@ -56,6 +60,9 @@ final class ADBClient {
     private let queue = DispatchQueue(label: "com.lath.fusionrecorder.adb")
     private var buffer = Data()
     private var isReady = false
+    /// 主动断开（我们关的）时不要报「掉线」。
+    private var closing = false
+    private var linkLostReported = false
     private var connectHandlers: [(Result<Void, Error>) -> Void] = []
     private var streams: [UInt32: Stream] = [:]
     private var nextLocalId: UInt32 = 0x10000001
@@ -110,6 +117,7 @@ final class ADBClient {
     }
 
     func disconnect() {
+        closing = true
         connection.cancel()
     }
 
@@ -463,6 +471,16 @@ final class ADBClient {
     }
 
     private func failAll(_ error: Error) {
+        // 0.5.7：握手**成功之后**连接断了，以前这里只是把 connect 回调打个失败，
+        // 上层完全不知道 —— 表现就是「眼镜明明断开了，App 还挂着『已就绪』，
+        // 点刷新预览/录制才莫名其妙失败」。现在单独报一次掉线。
+        if isReady && !closing && !linkLostReported {
+            linkLostReported = true
+            isReady = false
+            log?("连接已断开：\(error.localizedDescription)")
+            let notify = onLinkLost
+            DispatchQueue.main.async { notify?() }
+        }
         resolveConnect(.failure(error))
     }
 }

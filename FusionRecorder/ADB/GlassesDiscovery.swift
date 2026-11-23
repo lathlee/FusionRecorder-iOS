@@ -29,6 +29,11 @@ final class GlassesDiscovery {
     private let lastIPKey = "fusion.lastGlassesIP"
     private let adbPort: UInt16 = 5555
 
+    /// iPhone 开热点时，第一个连上来的设备通常是 172.20.10.2。
+    /// 换网络后（WiFi → 热点）眼镜地址会整个变掉，扫描时把这个地址一起探一下，
+    /// 能在 /24 全扫之前就命中。
+    static let hotspotGlassesIP = "172.20.10.2"
+
     private init() {}
 
     var lastIP: String? {
@@ -179,14 +184,13 @@ final class GlassesDiscovery {
         }.joined(separator: " · ")
     }
 
-    /// 界面显示用：私有地址优先；实在没有私有地址就退到第一个非 loopback，
-    /// 至少别让界面空着 —— 显示出来才知道到底读到的是什么地址。
+    /// 界面显示用：**只认局域网私有地址**。
+    /// 0.5.6 会退到「第一个非 loopback」，结果真机上把 VPN 的 16.2.0.0 显示成
+    /// 「本机 16.2.0.0」，用户直接判定「识别的 IP 不对」。那个地址对离线录制没用，
+    /// 宁可不显示。
     func displayLocalIP(for glassesIP: String?) -> String? {
         let all = localIPv4()
-        if let picked = Self.pickLocalIP(from: all.filter(Self.isPrivateIPv4), glassesIP: glassesIP) {
-            return picked
-        }
-        return all.first
+        return Self.pickLocalIP(from: all.filter(Self.isPrivateIPv4), glassesIP: glassesIP)
     }
 
     // MARK: - 主动申请「本地网络」权限

@@ -54,7 +54,6 @@ struct ContentView: View {
 
     // iPhone 端连接（交接包 §5：POC_PC_IP / POC_SCREEN_PORT / POC_CAM_PORT）
     @AppStorage("host") private var host = "192.168.101.133"
-    @AppStorage("iphoneHostIP") private var iphoneHostIP = ""
     @AppStorage("screenPort") private var screenPort = "9114"
     @AppStorage("cameraPort") private var cameraPort = "9115"
 
@@ -138,7 +137,7 @@ struct ContentView: View {
     }
 
     private var isLinked: Bool {
-        orchestrator.isConnected || orchestrator.stage == .ready
+        !orchestrator.linkLost && (orchestrator.isConnected || orchestrator.stage == .ready)
     }
 
     var body: some View {
@@ -198,8 +197,18 @@ struct ContentView: View {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { refreshLanIP() }
             }
         }
-        .onChange(of: orchestrator.glassesIP) { _ in
+        .onChange(of: orchestrator.glassesIP) { newValue in
+            // 眼镜换地址了（WiFi ↔ 热点）就把新地址写回去，
+            // 否则 host 还是旧值，预览/录制会拿着废地址去连。
+            if let ip = newValue, !ip.isEmpty, ip != host { host = ip }
             refreshLanIP()
+        }
+        // 掉线：清预览 + 让界面马上改成「已断开」，不等人去点任何按钮
+        .onChange(of: orchestrator.linkLost) { lost in
+            if lost {
+                frames.clear()
+                session.appendUser("眼镜连接已断开（换了网络 / IP 变了 / 眼镜睡了）")
+            }
         }
         // 断开就清掉预览：留着旧画面会让人误以为还连着
         .onChange(of: orchestrator.isConnected) { connected in
@@ -254,10 +263,13 @@ struct ContentView: View {
     private var statusPill: some View {
         let running = session.isRunning
         let connecting = orchestrator.isBusy
+        let lost = orchestrator.linkLost
         let color: Color = running ? Palette.danger
-            : (connecting ? Palette.accent : (isLinked ? Palette.green : Palette.hint))
+            : (connecting ? Palette.accent
+               : (lost ? Palette.warn : (isLinked ? Palette.green : Palette.hint)))
         let text: String = running ? "录制中 \(session.recordingElapsed)s"
-            : (connecting ? "连接中" : (isLinked ? "已就绪" : "未连接"))
+            : (connecting ? "连接中"
+               : (lost ? "已断开" : (isLinked ? "已就绪" : "未连接")))
         return HStack(spacing: 6) {
             Circle()
                 .fill(color)
@@ -511,10 +523,10 @@ struct ContentView: View {
                 Divider().overlay(Palette.stroke)
 
                 HStack(spacing: 8) {
-                    Image(systemName: "wifi")
+                    Image(systemName: lanIP.isEmpty ? "link" : "wifi")
                         .font(.system(size: 11))
                         .foregroundStyle(Palette.hint)
-                    Text("本机 \(lanIPLabel)")
+                    Text(lanIPLabel)
                         .font(.system(size: 11, design: .monospaced))
                         .foregroundStyle(Palette.secondary)
                     Spacer(minLength: 6)
@@ -544,21 +556,15 @@ struct ContentView: View {
 
     /// 手动填的优先。用户在「连接参数」里填了 IP，界面就得认，否则填了等于没填。
     private var effectiveLocalIP: String {
-        let manual = iphoneHostIP.trimmingCharacters(in: .whitespacesAndNewlines)
-        return manual.isEmpty ? lanIP : manual
-    }
-
-    private var lanIPSourceTag: String {
-        let manual = iphoneHostIP.trimmingCharacters(in: .whitespacesAndNewlines)
-        return manual.isEmpty ? "自动" : "手动"
+        lanIP
     }
 
     private var lanIPLabel: String {
-        let ip = effectiveLocalIP
-        if !ip.isEmpty { return ip + "（" + lanIPSourceTag + "）" }
-        if rawInterfaceCount == 0 { return "读不到 · 权限未放行" }
-        if orchestrator.isConnected { return "未取到 · 不影响录制" }
-        return "未取到"
+        // 0.5.7：只显示真正的局域网私有地址。
+        // 之前会把 VPN 的虚拟网卡当成「本机 IP」显示成 16.2.0.0 —— 用户看到
+        // 「识别的IP不对」，其实那个地址对离线录制毫无用处，显示它纯属误导。
+        if !lanIP.isEmpty { return "本机 " + lanIP }
+        return "眼镜直连 · 无需本机 IP"
     }
 
     /// 只有真正会让录制失败的情况才报警。
@@ -573,17 +579,11 @@ struct ContentView: View {
         let ip = effectiveLocalIP
         // 一个接口都枚举不到：这不是显示问题，扫描也一定会失败
         if rawInterfaceCount == 0 && ip.isEmpty {
-            return "iOS 没把本 App 的局域网访问放开（所以连本机 IP 都读不到、扫描也必然找不到眼镜）。"
-                + "把 App 切到后台再切回来，会弹「允许访问本地网络」，点允许；"
-                + "若之前误点过拒绝：设置 → 隐私与安全性 → 本地网络 → 打开「融合录屏」"
-                + "（弹过一次询问后，这一项才会出现在列表里）"
-        }
-        if ip.isEmpty {
-            return "只读到了非局域网的接口地址（通常是 VPN 的虚拟网卡），不影响离线录制；"
-                + "要连眼镜请确认双方在同一个 WiFi，或在「连接参数」里直接填眼镜 IP"
+            return "iOS 没把本 App 的局域网访问放开（读不到任何接口地址）。"
+                + "把 App 切到后台再切回来，会弹「允许访问本地网络」，点允许"
         }
         let g = connectionIP
-        if g != "—", !GlassesDiscovery.sameSubnet(ip, g) {
+        if !ip.isEmpty, g != "—", !GlassesDiscovery.sameSubnet(ip, g) {
             return "本机(\(ip)) 与眼镜(\(g)) 不在同一网段：让两者连同一个 WiFi，或开热点让眼镜连 iPhone"
         }
         return nil
@@ -772,12 +772,25 @@ struct ContentView: View {
             // ---- 连接参数 ----
             blockCard("连接参数", icon: "network") {
                 VStack(spacing: 9) {
-                    Text("眼镜无线 ADB 默认 5555；iPhone 开热点时眼镜连热点。")
+                    Text("眼镜无线 ADB 默认 5555。换网络（WiFi ↔ 热点）后眼镜 IP 会变，"
+                        + "点「重新扫描」会自动找；找不到就在这里填。")
                         .font(.system(size: 10.5))
                         .foregroundStyle(Palette.hint)
                         .fixedSize(horizontal: false, vertical: true)
                     fieldRow("眼镜 IP", text: $host, decimal: true)
-                    fieldRow("iPhone IP（留空自动）", text: $iphoneHostIP, decimal: true)
+                    HStack(spacing: 8) {
+                        Button("恢复默认 IP") {
+                            host = Self.defaultHost
+                            session.appendUser("眼镜 IP 已恢复默认 \(Self.defaultHost)")
+                        }
+                        .font(.system(size: 11.5, weight: .medium))
+                        .foregroundStyle(Palette.accent)
+                        .buttonStyle(.plain)
+                        Spacer()
+                        Text("当前 \(orchestrator.glassesIP ?? "未连接")")
+                            .font(.system(size: 10.5, design: .monospaced))
+                            .foregroundStyle(Palette.hint)
+                    }
                     fieldRow("屏幕流端口", text: $screenPort, decimal: false)
                     fieldRow("相机流端口", text: $cameraPort, decimal: false)
                 }
@@ -926,18 +939,23 @@ struct ContentView: View {
         if count != rawInterfaceCount { rawInterfaceCount = count }
     }
 
-    /// 重新扫描：把已知 IP 一起拿去找，**不再清空它们**。
-    ///
-    /// 0.5.4 的版本这里干过蠢事 —— 把「眼镜 IP」和「上次成功的 IP」都清空，
-    /// 结果本机又读不到局域网地址，候选表为空，扫描必然「未发现眼镜」，
-    /// 而且把唯一可用的地址也弄丢了（真机截图就是这么卡住的）。
-    /// 现在：有已知 IP 就优先探它，顺便触发 iOS 的「本地网络」权限框。
+    /// 候选地址：手填的 → 这副眼镜的常用地址 → 热点下常见的 172.20.10.2。
+    /// 扫描时先探这几个（每个 0.45 秒），命中就不用扫整个 /24。
+    private var knownCandidates: [String] {
+        var list: [String] = []
+        let typed = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        for ip in [typed, Self.defaultHost, GlassesDiscovery.hotspotGlassesIP] where !ip.isEmpty {
+            if !list.contains(ip) { list.append(ip) }
+        }
+        return list
+    }
+
+    /// 重新扫描：**真的去扫**（0.5.7 之前这个按钮其实只是拿手填/存着的 IP 直连，
+    /// 根本没扫，所以换了网络之后点它永远不会找到眼镜）。
     private func rescan() {
         guard !orchestrator.isBusy else { return }
-        let typed = host.trimmingCharacters(in: .whitespacesAndNewlines)
-        if typed.isEmpty { host = Self.defaultHost }      // 起码留一个可用地址
-        session.appendUser("重新扫描眼镜：先探已知 IP，再扫本机网段…")
-        autoDeploy()
+        session.appendUser("重新扫描：先探 \(knownCandidates.joined(separator: " / "))，再扫本机网段…")
+        autoScan()
     }
 
     /// 这副眼镜的地址（DHCP 长期稳定在 .133）。留作「重新扫描」的兜底，
@@ -946,8 +964,16 @@ struct ContentView: View {
 
     /// 刷新预览：抓屏幕上真实的一帧 + 相机拍一张，合成后立刻显示。
     private func refreshPreview() {
-        let given = host.trimmingCharacters(in: .whitespacesAndNewlines)
-        session.refreshPreview(host: given.isEmpty ? nil : given) { result in
+        // ★ 0.5.7：本地已经连上的那个 IP 优先。
+        // 以前用 `host`（AppStorage 里的手填值），换了网络之后它是旧的，
+        // 于是「明明录制能跑，刷新预览却连不上」。
+        let target = orchestrator.glassesIP ?? host
+        let given = target.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !given.isEmpty else {
+            session.appendUser("还没有眼镜 IP：先点「连接眼镜」，或在连接参数里填一个")
+            return
+        }
+        session.refreshPreview(host: given) { result in
             if case .failure(let error) = result {
                 session.appendUser("刷新预览失败：\(error.localizedDescription)")
             }
@@ -982,19 +1008,21 @@ struct ContentView: View {
     }
 
     private func autoDeploy() {
+        // 「连接眼镜」也走扫描：手填的 IP 只作为**候选**先探一次（0.45 秒），
+        // 探通就直接用它部署；探不通继续扫本机 /24。
+        // 以前这里是「拿着 AppStorage 里的 IP 直接连」——换了网络后那个 IP 是废的，
+        // 于是等 40 秒握手超时才报错，看着就像「IP 不对 / 连不上」。
+        autoScan()
+    }
+
+    private func autoScan() {
         guard !autoBusy else {
             session.appendUser("部署流程还在执行中，请稍等")
             return
         }
         autoBusy = true
-        let given = host.trimmingCharacters(in: .whitespacesAndNewlines)
-        let localIP = iphoneHostIP.trimmingCharacters(in: .whitespacesAndNewlines)
-        // 即使「眼镜 IP」是空的，也拿兜底地址探一次：既可能直接连上，
-        // 又能触发 iOS 的「本地网络」权限框（没这个权限，扫描永远找不到设备）。
-        let probeList = given.isEmpty ? [Self.defaultHost] : [given]
-        orchestrator.run(host: given.isEmpty ? nil : given,
-                         iphoneHostIP: localIP.isEmpty ? nil : localIP,
-                         extraCandidates: probeList) { [self] result in
+        orchestrator.run(host: nil, iphoneHostIP: nil,
+                         extraCandidates: knownCandidates) { [self] result in
             DispatchQueue.main.async {
                 self.autoBusy = false
                 self.refreshLanIP()
@@ -1019,11 +1047,11 @@ struct ContentView: View {
         autoBusy = true
         session.clearRecordResult()
         session.update(params: fusionParams)
-        let given = host.trimmingCharacters(in: .whitespacesAndNewlines)
-        let localIP = iphoneHostIP.trimmingCharacters(in: .whitespacesAndNewlines)
+        // 已经连上就用当前地址；没连上就传 nil 让编排器自己扫（传旧 IP 只会白等超时）
+        let target = orchestrator.glassesIP
         session.appendUser("点「开始录制」：开始走离线链路（部署 → 眼镜本地录制）")
-        session.startAuto(host: given.isEmpty ? nil : given,
-                          iphoneHostIP: localIP.isEmpty ? nil : localIP,
+        session.startAuto(host: target,
+                          iphoneHostIP: nil,
                           screenPort: UInt16(screenPort) ?? 9114,
                           cameraPort: UInt16(cameraPort) ?? 9115) { [self] result in
             DispatchQueue.main.async {

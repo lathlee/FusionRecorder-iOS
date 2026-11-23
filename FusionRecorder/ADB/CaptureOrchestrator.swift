@@ -46,10 +46,23 @@ final class CaptureOrchestrator: ObservableObject {
     /// 没连上就只显示占位，绝不回落到上一次的旧画面（真机上会被误读成「已连上」）。
     @Published private(set) var isConnected = false
 
+    /// 曾经连上过、但现在链路断了。界面用它把「已就绪」改成「已断开」，
+    /// 而不是继续骗人说还连着。
+    @Published private(set) var linkLost = false
+
+    /// 掉线时的外部通知（界面据此更新 UI / 触发自动重找）。
+    var onLinkLost: (() -> Void)?
+
     /// 已授权的那条 ADB 连接（部署完成后 RecorderSession 直接复用，
     /// 不再另开第二条 —— 真机上第二条连接经常卡在 AUTH/PUBLICKEY 上不返回）。
     private(set) var adb: ADBClient?
     private var deploymentOnly = false
+
+    // 链路存活检测：眼镜睡过去 / 换了 WiFi / IP 变了，TCP 往往不会立刻报错，
+    // 于是界面一直停在「已就绪」。每 6 秒发一条 echo，连续两次失败就判掉线。
+    private var heartbeat: DispatchSourceTimer?
+    private var heartbeatFails = 0
+    private var autoRelocated = false
 
     // MARK: - 命令构造（静态，便于离线对拍）
 
@@ -252,33 +265,33 @@ final class CaptureOrchestrator: ObservableObject {
     /// 否则会陷入死循环（没地址→不探局域网→不弹权限框→还是没地址）。
     func run(host: String? = nil, iphoneHostIP: String? = nil,
              extraCandidates: [String] = [],
+             cleanLog: Bool = true,
              completion: @escaping (Result<String, Error>) -> Void) {
         guard !isBusy else {
             completion(.failure(ADBError.connectionFailed("已有部署流程在执行")))
             return
         }
         isBusy = true
-        resetLog()
+        if cleanLog { resetLog() }
+        // 手动/按钮触发的这一轮，允许之后掉线时再自动重找一次
+        if cleanLog { autoRelocated = false }
 
         // phoneIP 必须在眼镜 IP 确定之后再算：用它选「与眼镜同网段」的本机地址。
         // 之前在函数开头就 localIPv4().first，取到过 16.2.0.0 虚拟接口 → 眼镜连不上。
         func deploy(to glassesAddress: String) {
-            // ★ 0.5.3：拿不到本机局域网 IP **不再阻断部署**。
-            // v0.5 之后是「离线架构」——眼镜自己录到本地文件，iPhone 只用 ADB 拉回来，
-            // 眼镜根本不需要反向连 iPhone。此时本机 IP 只是给 0.3.x 实时推流用的遗留参数。
-            // 真机踩过：iPhone 开着 VPN 时 localIPv4() 里只有 16.2.0.0 这类虚拟接口，
-            // 旧逻辑会先取一个假 IP，或者直接「无法确定 iPhone 局域网 IP」把部署掐死，
-            // 表现就是「连不上眼镜、IP 不对」。
-            let phone = iphoneHostIP ?? GlassesDiscovery.shared.bestLocalIP(for: glassesAddress)
-            if let phoneIP = phone {
+            // ★ 0.5.7：**彻底不认手动填的 iPhone IP**。
+            // 离线架构（v0.5+）里眼镜自己录到本地文件、iPhone 只主动连过去拉回来，
+            // 眼镜根本不需要反向连 iPhone —— 那个参数只在 0.3.x 的实时推流里用过。
+            // 界面上的「iPhone IP」输入框已被移除（它坑了三轮：填了没用 / 填错更难查）。
+            let phone = GlassesDiscovery.shared.bestLocalIP(for: glassesAddress)
+            if let phoneIP = phone, GlassesDiscovery.isPrivateIPv4(phoneIP) {
                 self.iphoneIP = phoneIP
-                let tag = iphoneHostIP == nil ? "自动" : "手动填写"
-                self.append("本机 IP：\(phoneIP)（\(tag)；离线架构不需要它，仅作记录）")
+                self.append("本机局域网地址：\(phoneIP)（离线录制不需要它，仅记录）")
             } else {
                 self.iphoneIP = nil
-                self.append("⚠︎ 没取到 iPhone 局域网 IP：离线录制不需要它，继续部署")
+                self.append("离线录制模式：不需要本机 IP（眼镜不外连）")
             }
-            self.connectAndDeploy(glassesIP: glassesAddress, iphoneIP: phone, completion: completion)
+            self.connectAndDeploy(glassesIP: glassesAddress, iphoneIP: self.iphoneIP, completion: completion)
         }
 
         // 先把网络现状打进日志：界面显示「本机 IP 未取到」时，
@@ -332,6 +345,8 @@ final class CaptureOrchestrator: ObservableObject {
 
         let client = ADBClient(host: glassesIP, port: 5555)
         client.log = { [weak self] message in self?.append("[ADB] \(message)") }
+        // 链路真断了立刻告诉界面 —— 别再挂着「已就绪」骗人。
+        client.onLinkLost = { [weak self] in self?.handleLinkLost() }
         adb = client
         setStage(.connecting, "CNXN / AUTH 握手")
         // 打出发公钥用的格式：这副眼镜**不会弹授权框**，它只认合法格式的公钥并静默接受，
@@ -346,7 +361,11 @@ final class CaptureOrchestrator: ObservableObject {
                 return
             case .success:
                 self.append("ADB 已授权并握手完成，指纹 \(ADBAuth.shared.fingerprint)")
-                DispatchQueue.main.async { self.isConnected = true }
+                DispatchQueue.main.async {
+                    self.isConnected = true
+                    self.linkLost = false
+                }
+                self.startHeartbeat()
                 self.verifyShell(client: client, phoneIP: phoneIP, completion: completion)
             }
         }
@@ -585,6 +604,73 @@ final class CaptureOrchestrator: ObservableObject {
         }
     }
 
+    // MARK: - 链路存活 / 掉线重找
+
+    private func startHeartbeat() {
+        stopHeartbeat()
+        let timer = DispatchSource.makeTimerSource(
+            queue: DispatchQueue(label: "com.lath.fusionrecorder.heartbeat"))
+        timer.schedule(deadline: .now() + 6, repeating: 6)
+        timer.setEventHandler { [weak self] in
+            DispatchQueue.main.async { self?.beat() }
+        }
+        timer.resume()
+        heartbeat = timer
+    }
+
+    private func stopHeartbeat() {
+        heartbeat?.cancel()
+        heartbeat = nil
+        heartbeatFails = 0
+    }
+
+    /// 每 6 秒一条 echo。为什么不能只靠 TCP 报错：换 WiFi/热点后旧地址常常是
+    /// 「黑洞」——包发出去没人回，NWConnection 能卡很久都不报 failed，
+    /// 于是界面一直显示「已就绪」，点预览/录制才莫名其妙失败。
+    private func beat() {
+        guard let client = adb, isConnected, !isBusy else { return }
+        client.shell("echo ok", timeout: 6) { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                switch result {
+                case .success:
+                    self.heartbeatFails = 0
+                    if self.linkLost { self.linkLost = false }
+                case .failure:
+                    self.heartbeatFails += 1
+                    if self.heartbeatFails >= 2 {
+                        self.heartbeatFails = 0
+                        self.handleLinkLost()
+                    }
+                }
+            }
+        }
+    }
+
+    /// 链路断了：立刻改状态，然后**自动重找一次**（只找一次，避免眼镜关机时无限重试）。
+    private func handleLinkLost() {
+        stopHeartbeat()
+        guard isConnected || stage == .ready else { return }
+        isConnected = false
+        linkLost = true
+        stage = .failed
+        stageDetail = "眼镜连接已断开（换了网络 / IP 变了 / 眼镜睡了）"
+        append("✗ 眼镜连接已断开，准备自动重找一次")
+        onLinkLost?()
+
+        guard !autoRelocated, !isBusy else { return }
+        autoRelocated = true
+        // 给网络切换留一点时间（热点刚连上时 DHCP 还没发完地址）
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+            guard let self = self, !self.isConnected, !self.isBusy else { return }
+            self.append("自动重找：先探已知地址，再扫本机网段…")
+            let extras = [GlassesDiscovery.shared.lastIP ?? "",
+                          GlassesDiscovery.hotspotGlassesIP].filter { !$0.isEmpty }
+            self.run(host: nil, iphoneHostIP: nil, extraCandidates: extras, cleanLog: false,
+                     completion: { _ in })
+        }
+    }
+
     // MARK: - 状态 / 日志
 
     private func setStage(_ stage: CaptureStage, _ detail: String) {
@@ -607,6 +693,7 @@ final class CaptureOrchestrator: ObservableObject {
     }
 
     private func finishFailure(_ message: String, completion: @escaping (Result<String, Error>) -> Void) {
+        stopHeartbeat()
         DispatchQueue.main.async {
             self.isConnected = false
             self.stage = .failed
