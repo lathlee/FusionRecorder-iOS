@@ -58,6 +58,14 @@
     <key>NSLocalNetworkUsageDescription</key>
     <string>通过局域网连接眼镜的无线 ADB 与两路视频流</string>
 
+    <!-- 0.5.6：主动 browse ADB 的 mDNS 服务，是触发「本地网络」权限框最可靠的一招。
+         没这两个声明，NWBrowser 会直接报 -72008 而不会弹框。 -->
+    <key>NSBonjourServices</key>
+    <array>
+        <string>_adb-tls-connect._tcp</string>
+        <string>_adb._tcp</string>
+    </array>
+
     <key>NSAppTransportSecurity</key>
     <dict>
         <key>NSAllowsLocalNetworking</key>

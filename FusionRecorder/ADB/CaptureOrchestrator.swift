@@ -272,7 +272,8 @@ final class CaptureOrchestrator: ObservableObject {
             let phone = iphoneHostIP ?? GlassesDiscovery.shared.bestLocalIP(for: glassesAddress)
             if let phoneIP = phone {
                 self.iphoneIP = phoneIP
-                self.append("本机 IP：\(phoneIP)（离线架构不需要它，仅作记录）")
+                let tag = iphoneHostIP == nil ? "自动" : "手动填写"
+                self.append("本机 IP：\(phoneIP)（\(tag)；离线架构不需要它，仅作记录）")
             } else {
                 self.iphoneIP = nil
                 self.append("⚠︎ 没取到 iPhone 局域网 IP：离线录制不需要它，继续部署")
@@ -280,9 +281,12 @@ final class CaptureOrchestrator: ObservableObject {
             self.connectAndDeploy(glassesIP: glassesAddress, iphoneIP: phone, completion: completion)
         }
 
-        // 先把网络现状打进日志：界面显示「未获取到局域网 IP」时，
+        // 先把网络现状打进日志：界面显示「本机 IP 未取到」时，
         // 这一行能直接看出是只有 VPN 接口、还是根本没接口。
         append("本机接口：\(GlassesDiscovery.shared.interfaceDump)")
+
+        // 主动碰一次局域网，把 iOS「本地网络」权限框逼出来（详见 GlassesDiscovery）。
+        GlassesDiscovery.shared.requestLocalNetworkPermission()
 
         if let given = host, !given.isEmpty {
             glassesIP = given
@@ -297,11 +301,13 @@ final class CaptureOrchestrator: ObservableObject {
                 guard let self = self else { return }
                 guard let found = result else {
                     // 别只丢一句「未发现」——把「怎么救」写清楚。
+                    // 0.5.6：这里以前写着「去 设置 → 本地网络 打开融合录屏」，
+                    // 可那个开关根本不存在（App 从没主动访问过局域网，系统也就没建这项），
+                    // 属于把人往死路上指。现在改成真正能做的四步。
                     let hint = "未发现眼镜：① 确认眼镜和 iPhone 在同一个 WiFi（或眼镜连 iPhone 热点）；"
                         + "② 确认眼镜的无线 ADB 开着（service.adb.tcp.port=5555）；"
-                        + "③ 若已知 IP，展开「调试与参数 → 连接参数」把「眼镜 IP」填上再点连接；"
-                        + "④ 若本机 IP 一直「未获取到」，去 设置 → 隐私与安全性 → 本地网络，"
-                        + "把「融合录屏」的开关打开（重装 App 后这个权限会掉）。"
+                        + "③ 展开「调试与参数 → 连接参数」，把已知的「眼镜 IP」填上再点连接（最省事）；"
+                        + "④ 本机 IP 读不到不影响连接 —— 本 App 只主动连眼镜，眼镜不需要连回来。"
                     self.finishFailure(hint, completion: completion)
                     return
                 }

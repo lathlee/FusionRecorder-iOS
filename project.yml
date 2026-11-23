@@ -78,8 +78,17 @@ settings:
     #                    局域网 IP，iOS 的「本地网络」权限框因此永远不弹 ——
     #                    死循环。现在始终拿已知 IP 硬探一次，顺手打破这个环。
     #                 另：部署日志新增「本机接口」一行，失败提示改成可执行的四条。
-    MARKETING_VERSION: "0.5.5"
-    CURRENT_PROJECT_VERSION: "27"
+    #         0.5.6 = 「本机 IP」这条线彻底理顺：
+    #                 ① 手动填的 iPhone IP 以前填了等于没填（界面只认自动探测值）——
+    #                    现在手动值优先，并标注「手动 / 自动」；
+    #                 ② 「去 设置 → 隐私与安全性 → 本地网络 打开融合录屏」这条提示
+    #                    是错的：App 从没主动访问过局域网，系统压根没建这个权限项，
+    #                    所以那个开关不存在。现在改成主动触发（Bonjour 浏览 + UDP 广播）
+    #                    让系统真的弹一次框，并需在 Info.plist 声明 NSBonjourServices；
+    #                 ③ 已连上时不再报警；离线架构下本机 IP 取不到只显示「不影响录制」；
+    #                 ④ 本机接口日志改成带接口名（en0 / utun3），一眼看出是不是只剩 VPN。
+    MARKETING_VERSION: "0.5.6"
+    CURRENT_PROJECT_VERSION: "28"
     # 侧载不需要 Apple 签名，签名交给 SideStore / AltStore 用免费 Apple ID 做
     CODE_SIGNING_ALLOWED: "NO"
     CODE_SIGNING_REQUIRED: "NO"

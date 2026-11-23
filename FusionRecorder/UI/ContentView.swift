@@ -26,6 +26,10 @@ import Photos
 import CoreGraphics
 
 struct ContentView: View {
+    /// 回到前台就重新读一次本机地址：iOS 的「本地网络」权限框是异步弹的，
+    /// 用户点完「允许」再切回来，这里才能读到刚被放行的局域网地址。
+    @Environment(\.scenePhase) private var scenePhase
+
     @StateObject private var session = RecorderSession()
     @StateObject private var frames = FrameStore()
     /// 全自动部署编排器（View 持有以观察状态，注入 session 共用同一实例）
@@ -173,9 +177,22 @@ struct ContentView: View {
             session.orchestrator = orchestrator
             session.update(params: fusionParams)
             refreshLanIP()
+            // 0.5.6：主动去碰一次局域网 —— 否则 iOS 永远不给这个 App 建
+            // 「本地网络」权限项，【设置 → 隐私与安全性 → 本地网络】里就永远没它。
+            GlassesDiscovery.shared.requestLocalNetworkPermission()
+            // 权限框是异步的，给它 1.5 秒再读一次接口地址
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { refreshLanIP() }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) { refreshLanIP() }
         }
         .onChange(of: fusionParams) { newValue in
             session.update(params: newValue)
+        }
+        .onChange(of: scenePhase) { phase in
+            if phase == .active {
+                GlassesDiscovery.shared.requestLocalNetworkPermission()
+                refreshLanIP()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { refreshLanIP() }
+            }
         }
         .onChange(of: orchestrator.glassesIP) { _ in
             refreshLanIP()
@@ -365,7 +382,7 @@ struct ContentView: View {
             return orchestrator.stageDetail.isEmpty ? "点下方重试连接" : orchestrator.stageDetail
         }
         if lanIP.isEmpty {
-            return "先确认「本地网络」权限已开，或展开「调试与参数 → 连接参数」手动填眼镜 IP"
+            return "点「连接眼镜」——眼镜 IP 已预填，会直连试一次\n（这副眼镜不弹 USB 授权框，也不需要本机 IP）"
         }
         return "连接后点「刷新预览」抓一帧真实画面\n没抓过帧就不显示旧画面"
     }
@@ -521,22 +538,44 @@ struct ContentView: View {
         return parts.joined(separator: "  ·  ")
     }
 
-    private var lanIPLabel: String {
-        lanIP.isEmpty ? "未获取到局域网 IP" : lanIP
+    /// 手动填的优先。用户在「连接参数」里填了 IP，界面就得认，否则填了等于没填。
+    private var effectiveLocalIP: String {
+        let manual = iphoneHostIP.trimmingCharacters(in: .whitespacesAndNewlines)
+        return manual.isEmpty ? lanIP : manual
     }
 
-    /// 网段不一致 / 取不到局域网 IP 时给出可执行的提示。
+    private var lanIPSourceTag: String {
+        let manual = iphoneHostIP.trimmingCharacters(in: .whitespacesAndNewlines)
+        return manual.isEmpty ? "自动" : "手动"
+    }
+
+    private var lanIPLabel: String {
+        let ip = effectiveLocalIP
+        if !ip.isEmpty { return ip + "（" + lanIPSourceTag + "）" }
+        // 离线架构（v0.5+）里眼镜是「iPhone 主动连过去」的，
+        // 本机 IP 只用于 0.3.x 那套实时推流，取不到完全不影响录制。
+        if orchestrator.isConnected { return "未取到 · 不影响录制" }
+        return "未取到"
+    }
+
+    /// 只有真正会让录制失败的情况才报警。
+    ///
+    /// 0.5.5 及以前这里只要读不到局域网 IP 就甩一句
+    /// 「去 设置 → 隐私与安全性 → 本地网络 打开」—— 而那个开关根本不存在
+    /// （App 从没主动访问过局域网，系统从没建过这项），属于把人往死路上指。
     private var networkWarning: String? {
         if orchestrator.isBusy { return nil }
-        if lanIP.isEmpty {
-            // 重装 App 后 iOS 的「本地网络」权限会掉，掉了就读不到局域网地址、
-            // 也连不上局域网设备。这是真机上最常见的一种「莫名其妙连不上」。
-            return "读不到 iPhone 的局域网 IP：到 设置 → 隐私与安全性 → 本地网络，"
-                + "把「融合录屏」打开（重装后这个权限会掉）；已开热点则点「重新扫描」"
+        // 已经连上了还报警，只会让人以为出了问题
+        if orchestrator.isConnected { return nil }
+        let ip = effectiveLocalIP
+        if ip.isEmpty {
+            return "没读到本机局域网地址。离线录制不需要它（眼镜是直连的），"
+                + "不影响连接；若想让它显示出来，把 App 切到后台再切回来，"
+                + "系统会弹「本地网络」权限询问，点允许即可"
         }
         let g = connectionIP
-        if g != "—", !GlassesDiscovery.sameSubnet(lanIP, g) {
-            return "iPhone(\(lanIP)) 与眼镜(\(g)) 不在同一网段：让两者连同一个 WiFi，或开热点让眼镜连 iPhone"
+        if g != "—", !GlassesDiscovery.sameSubnet(ip, g) {
+            return "本机(\(ip)) 与眼镜(\(g)) 不在同一网段：让两者连同一个 WiFi，或开热点让眼镜连 iPhone"
         }
         return nil
     }
@@ -872,7 +911,7 @@ struct ContentView: View {
     // MARK: - 行为
 
     private func refreshLanIP() {
-        let ip = GlassesDiscovery.shared.lanIP(for: orchestrator.glassesIP ?? host) ?? ""
+        let ip = GlassesDiscovery.shared.displayLocalIP(for: orchestrator.glassesIP ?? host) ?? ""
         if ip != lanIP { lanIP = ip }
     }
 

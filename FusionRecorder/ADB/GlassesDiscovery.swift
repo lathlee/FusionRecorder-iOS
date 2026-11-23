@@ -140,18 +140,111 @@ final class GlassesDiscovery {
         return pa[0] == pb[0] && pa[1] == pb[1] && pa[2] == pb[2]
     }
 
+    /// 接口名 + IPv4（诊断用）。能看到是 `en0`（WiFi）还是 `utun3`（VPN）：
+    /// 界面显示「未获取到局域网 IP」时，这一行就能定性。
+    func localIPv4Named() -> [(name: String, ip: String)] {
+        var result: [(name: String, ip: String)] = []
+        var addresses: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&addresses) == 0, let first = addresses else { return result }
+        defer { freeifaddrs(addresses) }
+
+        var cursor: UnsafeMutablePointer<ifaddrs>? = first
+        while let current = cursor {
+            let ifa = current.pointee
+            if let addr = ifa.ifa_addr, addr.pointee.sa_family == UInt8(AF_INET) {
+                var buffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+                if inet_ntop(AF_INET, addr, &buffer, socklen_t(INET_ADDRSTRLEN)) != nil {
+                    let ip = String(cString: buffer)
+                    var name = "?"
+                    if let namePtr = ifa.ifa_name { name = String(cString: namePtr) }
+                    if ip != "127.0.0.1" { result.append((name: name, ip: ip)) }
+                }
+            }
+            cursor = ifa.ifa_next
+        }
+        return result
+    }
+
     /// 所有接口的 IPv4 清单，纯粹给部署日志看（诊断用）。
     /// 真机踩过：界面上「本机 IP 未获取到」，但日志里能看到到底有哪些接口、
     /// 是不是只有 VPN 的 16.x，一眼就能判断问题在哪。
     func interfaceDump() -> String {
-        let all = localIPv4()
-        if all.isEmpty { return "无（连 127.0.0.1 都没有，异常）" }
-        return all.map { ip -> String in
+        let all = localIPv4Named()
+        if all.isEmpty { return "无 IPv4 接口（连 127.0.0.1 都没有，异常）" }
+        return all.map { item -> String in
             // 别在插值里嵌三元字符串：`"\(a ? "" : "x")"` 这种写法会把字面量提前截断，
             // 编译期报「consecutive statements on a line must be separated by ';'」。
-            let tag = Self.isPrivateIPv4(ip) ? "" : "（非局域网）"
-            return ip + tag
-        }.joined(separator: " , ")
+            let tag = Self.isPrivateIPv4(item.ip) ? "" : "(非局域网)"
+            return item.name + "=" + item.ip + tag
+        }.joined(separator: " · ")
+    }
+
+    /// 界面显示用：私有地址优先；实在没有私有地址就退到第一个非 loopback，
+    /// 至少别让界面空着 —— 显示出来才知道到底读到的是什么地址。
+    func displayLocalIP(for glassesIP: String?) -> String? {
+        let all = localIPv4()
+        if let picked = Self.pickLocalIP(from: all.filter(Self.isPrivateIPv4), glassesIP: glassesIP) {
+            return picked
+        }
+        return all.first
+    }
+
+    // MARK: - 主动申请「本地网络」权限
+
+    private var permissionBrowser: NWBrowser?
+    private var broadcastProbe: NWConnection?
+
+    /// 主动触发 iOS 的「本地网络」权限框（0.5.6 新增）。
+    ///
+    /// 为什么必须要它：iOS 14+ 只有在 App **真的去访问局域网**时才弹框。
+    /// 之前所有版本都没主动访问过 —— 本机地址读不到 → 拼不出 /24 候选 →
+    /// 从不去连局域网 IP → 系统永不弹框 → 【设置 → 隐私与安全性 → 本地网络】里
+    /// 永远没有本 App 这一项。用户反馈「找不到这个开关」正是这个死循环。
+    /// 开一个 Bonjour 浏览器 + 发一个 UDP 广播，系统就会判定要访问局域网并弹框。
+    func requestLocalNetworkPermission() {
+        triggerBroadcastProbe()
+        guard permissionBrowser == nil else { return }
+        let params = NWParameters.tcp
+        params.includePeerToPeer = true
+        let browser = NWBrowser(for: .bonjour(service: "_adb-tls-connect._tcp", domain: nil),
+                                using: params)
+        permissionBrowser = browser
+        browser.stateUpdateHandler = { [weak self] state in
+            switch state {
+            case .ready:
+                NSLog("[Discovery] Bonjour 就绪：本地网络权限已放行")
+            case .failed(let error):
+                NSLog("[Discovery] Bonjour 失败：\(error.localizedDescription)")
+                self?.permissionBrowser?.cancel()
+                self?.permissionBrowser = nil
+            default:
+                break
+            }
+        }
+        browser.browseResultsChangedHandler = { results, _ in
+            for result in results {
+                NSLog("[Discovery] Bonjour 服务：\(result.endpoint)")
+            }
+        }
+        browser.start(queue: DispatchQueue.global(qos: .utility))
+    }
+
+    /// UDP 广播探测：不依赖 Info.plist 的 Bonjour 声明也能触发权限框。
+    private func triggerBroadcastProbe() {
+        if broadcastProbe != nil { return }
+        let params = NWParameters.udp
+        params.allowLocalEndpointReuse = true
+        let conn = NWConnection(host: "255.255.255.255", port: 9, using: params)
+        broadcastProbe = conn
+        conn.stateUpdateHandler = { [weak self] state in
+            if case .failed(let error) = state {
+                NSLog("[Discovery] 广播探测结束：\(error.localizedDescription)")
+                self?.broadcastProbe?.cancel()
+                self?.broadcastProbe = nil
+            }
+        }
+        conn.start(queue: DispatchQueue.global(qos: .utility))
+        conn.send(content: Data([0x00]), completion: .contentProcessed { _ in })
     }
 
     /// 扫描候选地址：上次成功的 IP 优先，然后本机各网段的 /24。
