@@ -307,7 +307,8 @@ final class RecorderSession: ObservableObject {
         }
     }
 
-    /// 轮询两个文件大小，连续两次一致且非零才算写完（最多约 10 秒）。
+    /// 等两个 mp4 封口。命令本身会轮询（0.6 秒一轮、最多 18 轮，最坏约 14 秒），
+    /// 只有真的始终没等到 `.meta` 才会回 WAITING。
     private func waitFilesThenPull(adb: ADBClient) {
         let command = CaptureOrchestrator.waitFilesCommand()
         adb.shell(command, timeout: 25) { [weak self] result in
@@ -319,7 +320,8 @@ final class RecorderSession: ObservableObject {
                 let text = output.trimmingCharacters(in: .whitespacesAndNewlines)
                 self.append("文件就绪检查：\(text)")
                 guard text.contains("READY") else {
-                    self.fail("眼镜端 mp4 未写完或为空：\(text)")
+                    self.fail("眼镜端 mp4 等了 14 秒仍未封口：\(text)"
+                              + "（meta=s1c0 表示相机那路还没写完，可看眼镜 logcat 的 FusionCamStream）")
                     return
                 }
                 // "READY screen=10969 camera=1924360" → 拿这两个数当拉取进度分母

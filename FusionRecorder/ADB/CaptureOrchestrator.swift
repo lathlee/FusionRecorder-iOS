@@ -135,23 +135,34 @@ final class CaptureOrchestrator: ObservableObject {
         "am startservice -n com.fusion.capture/.CameraStreamService -a com.fusion.capture.STOP_CAMERA"
     }
 
-    /// 等两个 mp4 写完：**必须看到 `<mp4>.meta` 才算完**。
+    /// 等两个 mp4 写完：**必须看到 `<mp4>.meta` 才算完**，并且要在一次 shell 调用里**轮询**。
     ///
-    /// 只看「两次采样大小一致」不够：muxer 在写 moov 之前会有一次停顿，
+    /// 为什么不能只看「两次采样大小一致」：muxer 写 moov 之前会有一次停顿，
     /// 0.5 秒内两次采样可能相同，于是提前判 READY。实测真机就踩了 ——
     /// 判 READY 时相机 mp4 是 10739744，最终是 10788082（差 48KB 的 moov），
     /// 结果拉回来的字节数「对不上」，一次成功的传输被判成失败。
     /// meta 是 muxer.stop() 之后才写的，它的存在就等于「文件已封口」。
+    ///
+    /// 为什么必须是循环：停止命令是异步送达的（相机要 drain EOS 再 `muxer.stop()`），
+    /// 采样一次就下结论的话，只要收尾比 0.5 秒慢就会直接判「没写完」。
+    /// 这里 0.6 秒一轮最多 18 轮（真机实测最坏 13.4 秒），比旧的「一次定生死」稳得多。
     static func waitFilesCommand() -> String {
         let s = screenMP4Path
         let c = cameraMP4Path
-        return "s1=$(stat -c %s \(s) 2>/dev/null || echo 0); c1=$(stat -c %s \(c) 2>/dev/null || echo 0); "
-            + "sleep 0.5; s2=$(stat -c %s \(s) 2>/dev/null || echo 0); c2=$(stat -c %s \(c) 2>/dev/null || echo 0); "
-            + "if [ \"$s1\" = \"$s2\" ] && [ \"$c1\" = \"$c2\" ] && [ \"$s1\" != \"0\" ] && [ \"$c1\" != \"0\" ] "
-            + "&& [ -f \(s).meta ] && [ -f \(c).meta ]; "
-            + "then echo READY screen=$s2 camera=$c2; "
-            + "else echo WAITING screen=$s2/$s1 camera=$c2/$c1 "
-            + "meta=$( [ -f \(s).meta ] && echo s1 || echo s0 )$( [ -f \(c).meta ] && echo c1 || echo c0 ); fi"
+        return "ok=0; i=0; while [ $i -lt 18 ]; do "
+            + "s1=$(stat -c %s \(s) 2>/dev/null || echo 0); "
+            + "c1=$(stat -c %s \(c) 2>/dev/null || echo 0); "
+            + "sm=$( [ -f \(s).meta ] && echo 1 || echo 0 ); "
+            + "cm=$( [ -f \(c).meta ] && echo 1 || echo 0 ); "
+            + "sleep 0.6; "
+            + "s2=$(stat -c %s \(s) 2>/dev/null || echo 0); "
+            + "c2=$(stat -c %s \(c) 2>/dev/null || echo 0); "
+            + "if [ \"$s1\" = \"$s2\" ] && [ \"$c1\" = \"$c2\" ] "
+            + "&& [ \"$s2\" != \"0\" ] && [ \"$c2\" != \"0\" ] "
+            + "&& [ \"$sm\" = \"1\" ] && [ \"$cm\" = \"1\" ]; "
+            + "then echo READY screen=$s2 camera=$c2; ok=1; break; fi; "
+            + "i=$((i+1)); done; "
+            + "if [ \"$ok\" != \"1\" ]; then echo WAITING screen=$s2/$s1 camera=$c2/$c1 meta=$sm$cm; fi"
     }
 
     static func stopCameraCommand() -> String {
