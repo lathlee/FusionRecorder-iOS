@@ -47,6 +47,10 @@ struct ContentView: View {
     @State private var cameraPicker: PhotosPickerItem?
     /// 本机局域网 IP（只在「局域网私有地址」里挑，见 GlassesDiscovery.lanIP）
     @State private var lanIP = ""
+    /// `getifaddrs` 实际枚举到的 IPv4 条数（不含 loopback）。
+    /// 0 意味着 iOS 根本没把局域网接口暴露给本 App —— 那不是「显示问题」，
+    /// 而是连扫描都会必然失败的真故障，必须明确报警。
+    @State private var rawInterfaceCount = 0
 
     // iPhone 端连接（交接包 §5：POC_PC_IP / POC_SCREEN_PORT / POC_CAM_PORT）
     @AppStorage("host") private var host = "192.168.101.133"
@@ -552,8 +556,7 @@ struct ContentView: View {
     private var lanIPLabel: String {
         let ip = effectiveLocalIP
         if !ip.isEmpty { return ip + "（" + lanIPSourceTag + "）" }
-        // 离线架构（v0.5+）里眼镜是「iPhone 主动连过去」的，
-        // 本机 IP 只用于 0.3.x 那套实时推流，取不到完全不影响录制。
+        if rawInterfaceCount == 0 { return "读不到 · 权限未放行" }
         if orchestrator.isConnected { return "未取到 · 不影响录制" }
         return "未取到"
     }
@@ -568,10 +571,16 @@ struct ContentView: View {
         // 已经连上了还报警，只会让人以为出了问题
         if orchestrator.isConnected { return nil }
         let ip = effectiveLocalIP
+        // 一个接口都枚举不到：这不是显示问题，扫描也一定会失败
+        if rawInterfaceCount == 0 && ip.isEmpty {
+            return "iOS 没把本 App 的局域网访问放开（所以连本机 IP 都读不到、扫描也必然找不到眼镜）。"
+                + "把 App 切到后台再切回来，会弹「允许访问本地网络」，点允许；"
+                + "若之前误点过拒绝：设置 → 隐私与安全性 → 本地网络 → 打开「融合录屏」"
+                + "（弹过一次询问后，这一项才会出现在列表里）"
+        }
         if ip.isEmpty {
-            return "没读到本机局域网地址。离线录制不需要它（眼镜是直连的），"
-                + "不影响连接；若想让它显示出来，把 App 切到后台再切回来，"
-                + "系统会弹「本地网络」权限询问，点允许即可"
+            return "只读到了非局域网的接口地址（通常是 VPN 的虚拟网卡），不影响离线录制；"
+                + "要连眼镜请确认双方在同一个 WiFi，或在「连接参数」里直接填眼镜 IP"
         }
         let g = connectionIP
         if g != "—", !GlassesDiscovery.sameSubnet(ip, g) {
@@ -913,6 +922,8 @@ struct ContentView: View {
     private func refreshLanIP() {
         let ip = GlassesDiscovery.shared.displayLocalIP(for: orchestrator.glassesIP ?? host) ?? ""
         if ip != lanIP { lanIP = ip }
+        let count = GlassesDiscovery.shared.localIPv4().count
+        if count != rawInterfaceCount { rawInterfaceCount = count }
     }
 
     /// 重新扫描：把已知 IP 一起拿去找，**不再清空它们**。
