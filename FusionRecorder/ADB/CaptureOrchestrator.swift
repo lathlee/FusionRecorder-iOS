@@ -258,14 +258,21 @@ final class CaptureOrchestrator: ObservableObject {
         // phoneIP 必须在眼镜 IP 确定之后再算：用它选「与眼镜同网段」的本机地址。
         // 之前在函数开头就 localIPv4().first，取到过 16.2.0.0 虚拟接口 → 眼镜连不上。
         func deploy(to glassesAddress: String) {
+            // ★ 0.5.3：拿不到本机局域网 IP **不再阻断部署**。
+            // v0.5 之后是「离线架构」——眼镜自己录到本地文件，iPhone 只用 ADB 拉回来，
+            // 眼镜根本不需要反向连 iPhone。此时本机 IP 只是给 0.3.x 实时推流用的遗留参数。
+            // 真机踩过：iPhone 开着 VPN 时 localIPv4() 里只有 16.2.0.0 这类虚拟接口，
+            // 旧逻辑会先取一个假 IP，或者直接「无法确定 iPhone 局域网 IP」把部署掐死，
+            // 表现就是「连不上眼镜、IP 不对」。
             let phone = iphoneHostIP ?? GlassesDiscovery.shared.bestLocalIP(for: glassesAddress)
-            guard let phoneIP = phone else {
-                self.finishFailure("无法确定 iPhone 局域网 IP：确认已连上 WiFi/热点", completion: completion)
-                return
+            if let phoneIP = phone {
+                self.iphoneIP = phoneIP
+                self.append("本机 IP：\(phoneIP)（离线架构不需要它，仅作记录）")
+            } else {
+                self.iphoneIP = nil
+                self.append("⚠︎ 没取到 iPhone 局域网 IP：离线录制不需要它，继续部署")
             }
-            self.iphoneIP = phoneIP
-            self.append("本机 IP：\(phoneIP)（下发采集端的 host，眼镜会连它）")
-            self.connectAndDeploy(glassesIP: glassesAddress, iphoneIP: phoneIP, completion: completion)
+            self.connectAndDeploy(glassesIP: glassesAddress, iphoneIP: phone, completion: completion)
         }
 
         if let given = host, !given.isEmpty {
@@ -296,10 +303,8 @@ final class CaptureOrchestrator: ObservableObject {
 
     private func connectAndDeploy(glassesIP: String, iphoneIP: String?,
                                   completion: @escaping (Result<String, Error>) -> Void) {
-        guard let phoneIP = iphoneIP else {
-            finishFailure("拿不到 iPhone 的局域网 IP，无法告诉眼镜往哪推流；请手动指定", completion: completion)
-            return
-        }
+        // 离线架构下 host 可以为空（眼镜不外连），只是日志里少一行
+        let phoneIP = iphoneIP ?? ""
 
         let client = ADBClient(host: glassesIP, port: 5555)
         client.log = { [weak self] message in self?.append("[ADB] \(message)") }
