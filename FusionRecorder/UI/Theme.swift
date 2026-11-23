@@ -59,6 +59,8 @@ enum Options {
     static let bitrates = ["2 Mbps", "4 Mbps", "6 Mbps", "10 Mbps"]
     static let rotations = ["0°", "90°", "180°", "270°"]
     static let durations = ["不限", "15 秒", "30 秒", "60 秒", "5 分钟"]
+    /// 0.6.2 去黑底的两种算法：亮度键（保留对比、黑底全透）/ 滤色（更亮但更柔）
+    static let keyModes = ["亮度键（推荐）", "滤色（更亮）"]
 }
 
 /// 通用卡片容器：圆角 + 细描边，全 App 统一一种卡片观感。

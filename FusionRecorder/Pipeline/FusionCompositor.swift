@@ -16,6 +16,18 @@
 //            src  = vec4(rgb*a + add*0.6, a + |add|*0.35)     // 预乘
 //    混合    GL_ONE / GL_ONE_MINUS_SRC_ALPHA
 //
+//  0.6.2 新增「去黑底」（params.keyMode）：
+//    1 = 亮度键  lum = dot(rgb, (0.2126,0.7152,0.0722))
+//                keyA = smoothstep(threshold, threshold+softness, lum)
+//                a    = alpha * mask * edge * keyA * gain
+//                纯黑 → keyA=0 → 该像素完全不叠加 → 背景原样露出相机画面
+//    2 = 滤色    out = 1-(1-底)(1-上)；黑天然不改变底色，代价是整体提亮
+//    0 = 关闭，走原来的整体混色（与 0.6.1 及以前完全一致）
+//
+//  为什么要它：screencap 给的是**不透明** RGBA，黑背景就是黑色像素；
+//  而波导眼镜在光学上「黑 = 不发光 = 透明」，肉眼看不到黑底。
+//  录成视频要还原这个光学特性，只能靠 key。
+//
 //  与 tools/render_preview.py 逐行等价，可用该脚本离线核对成片里的这一帧。
 //
 //  ⚠️ 一致性约定（改代码前先读）：
@@ -90,6 +102,12 @@ enum FusionCompositor {
         let fTintR = Float(params.tintR), fTintG = Float(params.tintG), fTintB = Float(params.tintB)
         let fCrop = Float(crop)
 
+        // 去黑底参数（0 = 关 / 1 = 亮度键 / 2 = 滤色）
+        let keyMode = params.keyMode
+        let keyThreshold = Float(params.keyThreshold)
+        let keySoftness = max(Float(params.keySoftness), 0.001)
+        let keyGain = max(Float(params.keyGain), 0.0)
+
         // roundedBoxMask 里的 overlayAspect（用未裁切的 overlayPhysW/H）
         let maxPhys = max(overlayPhysW, overlayPhysH)
         let aspectX = Float(maxPhys / overlayPhysW)
@@ -149,19 +167,57 @@ enum FusionCompositor {
                         var g = min(max(sG * fTintG * fBrightness, 0.0), 1.0)
                         var b = min(max(sB * fTintB * fBrightness, 0.0), 1.0)
 
-                        let addR = r * a * fAdditive
-                        let addG = g * a * fAdditive
-                        let addB = b * a * fAdditive
-                        let srcR = r * a + addR * 0.6
-                        let srcG = g * a + addG * 0.6
-                        let srcB = b * a + addB * 0.6
-                        let srcA = min(max(a + sqrtf(addR * addR + addG * addG + addB * addB) * 0.35, 0.0), 1.0)
-
                         let di = dstRow + x * 4
-                        let keep = 1.0 - srcA
-                        r = min(max(srcR + (Float(dst[di + 2]) / 255.0) * keep, 0.0), 1.0)
-                        g = min(max(srcG + (Float(dst[di + 1]) / 255.0) * keep, 0.0), 1.0)
-                        b = min(max(srcB + (Float(dst[di]) / 255.0) * keep, 0.0), 1.0)
+
+                        // ---- 去黑底 -------------------------------------------------
+                        // 波导眼镜在光学上「黑 = 不发光 = 透明」，但 screencap 给出的
+                        // 是不透明像素。这里用两种方式把「黑」还原成「无」。
+                        if keyMode == 1 {
+                            // 亮度键：用亮度本身当 alpha。
+                            // 纯黑 → keyA=0 → 一个像素都不叠加，背景原样露出相机画面。
+                            let lum = 0.2126 * r + 0.7152 * g + 0.0722 * b
+                            let keyA = smoothstep(keyThreshold, keyThreshold + keySoftness, lum)
+                            let ka = a * keyA * keyGain
+                            if ka <= 0.0001 { continue }
+                            let addR = r * ka * fAdditive
+                            let addG = g * ka * fAdditive
+                            let addB = b * ka * fAdditive
+                            let srcR = r * ka + addR * 0.6
+                            let srcG = g * ka + addG * 0.6
+                            let srcB = b * ka + addB * 0.6
+                            let srcA = min(max(ka + sqrtf(addR * addR + addG * addG + addB * addB) * 0.35,
+                                               0.0), 1.0)
+                            let keep = 1.0 - srcA
+                            r = min(max(srcR + (Float(dst[di + 2]) / 255.0) * keep, 0.0), 1.0)
+                            g = min(max(srcG + (Float(dst[di + 1]) / 255.0) * keep, 0.0), 1.0)
+                            b = min(max(srcB + (Float(dst[di]) / 255.0) * keep, 0.0), 1.0)
+                        } else if keyMode == 2 {
+                            // 滤色 / Screen：out = 1-(1-底)(1-上)。
+                            // 黑(0) 天然不改变底色，所以不需要阈值；代价是整体被提亮。
+                            let k = min(a * keyGain, 1.0)
+                            let sr = min(r * k, 1.0), sg = min(g * k, 1.0), sb = min(b * k, 1.0)
+                            let baseR = Float(dst[di + 2]) / 255.0
+                            let baseG = Float(dst[di + 1]) / 255.0
+                            let baseB = Float(dst[di]) / 255.0
+                            r = 1.0 - (1.0 - baseR) * (1.0 - sr)
+                            g = 1.0 - (1.0 - baseG) * (1.0 - sg)
+                            b = 1.0 - (1.0 - baseB) * (1.0 - sb)
+                        } else {
+                            // 原始整体混色（默认关闭去黑底时走这条，行为与旧版一致）
+                            let addR = r * a * fAdditive
+                            let addG = g * a * fAdditive
+                            let addB = b * a * fAdditive
+                            let srcR = r * a + addR * 0.6
+                            let srcG = g * a + addG * 0.6
+                            let srcB = b * a + addB * 0.6
+                            let srcA = min(max(a + sqrtf(addR * addR + addG * addG + addB * addB) * 0.35,
+                                               0.0), 1.0)
+                            let keep = 1.0 - srcA
+                            r = min(max(srcR + (Float(dst[di + 2]) / 255.0) * keep, 0.0), 1.0)
+                            g = min(max(srcG + (Float(dst[di + 1]) / 255.0) * keep, 0.0), 1.0)
+                            b = min(max(srcB + (Float(dst[di]) / 255.0) * keep, 0.0), 1.0)
+                        }
+
                         dst[di]     = UInt8(b * 255.0 + 0.5)
                         dst[di + 1] = UInt8(g * 255.0 + 0.5)
                         dst[di + 2] = UInt8(r * 255.0 + 0.5)

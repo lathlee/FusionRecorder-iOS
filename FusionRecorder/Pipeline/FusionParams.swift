@@ -38,16 +38,32 @@ struct FusionParams: Equatable {
 
     // MARK: - 叠加效果（主界面 10 条滑杆）
 
-    var alpha: Double = 0.55          // 屏幕透明度
-    var scale: Double = 0.55           // 屏幕占比（宽度占画布宽）
+    var alpha: Double = 0.60          // 屏幕透明度
+    var scale: Double = 0.75           // 屏幕占比（宽度占画布宽）
     var offsetX: Double = 0.0          // 水平位置（单位：画布宽）
     var offsetY: Double = 0.06          // 垂直位置（单位：画布高，正值向上）
     var additive: Double = 0.35       // 发光强度（加色混合比例）
-    var corner: Double = 0.10          // 圆角（相对 overlay 短边）
-    var edgeFade: Double = 0.12        // 边缘渐隐宽度
+    var corner: Double = 0.04          // 圆角（相对 overlay 短边）
+    var edgeFade: Double = 0.0         // 边缘渐隐宽度
     var brightness: Double = 1.0        // 屏幕亮度
-    var contrast: Double = 1.0         // 摄像头对比度
-    var crop: Double = 0.06            // 裁掉屏幕内容右侧（悬浮球不入镜）
+    var contrast: Double = 0.75        // 摄像头对比度
+    var crop: Double = 0.0             // 裁掉屏幕内容右侧（悬浮球不入镜）
+
+    // MARK: - 去黑底（0.6.2）
+
+    /// 0 = 关闭（原来的整体混色）；1 = 亮度键；2 = 滤色。
+    ///
+    /// 为什么需要它：`screencap` 拿到的是**不透明** RGBA，黑背景就是实实在在的
+    /// 黑色像素。而波导眼镜在光学上「黑 = 不发光 = 透明」，所以肉眼透过镜片
+    /// 看不到黑底，录成数字视频却会留一块黑矩形。要还原那个光学特性，
+    /// 就得用亮度键 / 滤色把「黑」当成「无」。
+    var keyMode: Int = 0
+    /// 亮度低于它 → 完全透明（亮度键）
+    var keyThreshold: Double = 0.06
+    /// 阈值附近的过渡宽度，避免边缘发硬
+    var keySoftness: Double = 0.06
+    /// 内容增益：背景换成相机画面后对比度会下降，用它把内容提亮一点
+    var keyGain: Double = 1.0
 
     // MARK: - 声音（0.5.0）
 
@@ -97,7 +113,8 @@ struct FusionParams: Equatable {
         let values: [Double] = [alpha, scale, offsetX, offsetY, additive, corner,
                                 edgeFade, brightness, contrast, crop,
                                 cameraBrightness, tintR, tintG, tintB,
-                                skewTop, skewBottom]
+                                skewTop, skewBottom,
+                                Double(keyMode), keyThreshold, keySoftness, keyGain]
         let body = values.map { String(format: "%.4f", $0) }.joined(separator: ",")
         return "\(canvasWidth)x\(canvasHeight)@r\(rotation)[\(body)]"
     }

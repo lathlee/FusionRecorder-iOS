@@ -68,16 +68,32 @@ struct ContentView: View {
     @AppStorage("durationIndex") private var durationIndex = 3
 
     // 叠加效果（范围/默认值取自 MainActivity.setSlider 与 OverlayConfig）
-    @AppStorage("alpha") private var alpha = 0.55
-    @AppStorage("scale") private var scale = 0.55
+    // 0.6.2 按真机观感重调了六个默认值（alpha/scale/corner/edge/contrast/crop）
+    @AppStorage("alpha") private var alpha = 0.60
+    @AppStorage("scale") private var scale = 0.75
     @AppStorage("offsetX") private var offsetX = 0.0
     @AppStorage("offsetY") private var offsetY = 0.06
     @AppStorage("additive") private var additive = 0.35
-    @AppStorage("corner") private var corner = 0.10
-    @AppStorage("edge") private var edge = 0.12
+    @AppStorage("corner") private var corner = 0.04
+    @AppStorage("edge") private var edge = 0.0
     @AppStorage("brightness") private var brightness = 1.0
-    @AppStorage("contrast") private var contrast = 1.0
-    @AppStorage("crop") private var crop = 0.06
+    @AppStorage("contrast") private var contrast = 0.75
+    @AppStorage("crop") private var crop = 0.0
+
+    // ---- 去黑底（0.6.2）----
+    // 波导眼镜光学上「黑 = 不发光 = 透明」，但录屏拍到的是不透明像素，
+    // 于是成片里会留一块黑矩形。开启后按亮度把黑当成「无」。
+    // 默认开：用户要的就是「看不到黑底」；屏幕内容本身很暗（放夜戏视频）时可关掉。
+    @AppStorage("keyEnabled") private var keyEnabled = true
+    @AppStorage("keyModeIndex") private var keyModeIndex = 0    // 0 亮度键 / 1 滤色
+    @AppStorage("keyThreshold") private var keyThreshold = 0.06
+    @AppStorage("keySoftness") private var keySoftness = 0.06
+    @AppStorage("keyGain") private var keyGain = 1.0
+
+    /// 默认值版本号：只在新装或第一次升到这个版本时把六个新默认值写进去。
+    /// @AppStorage 的值一旦写进 UserDefaults 就不会被代码里的默认值更新，
+    /// 所以不迁移的话老用户永远看不到新默认值。
+    @AppStorage("defaultsRev") private var defaultsRev = 0
 
     /// 0.5.0：成片音量倍数（1.0 = 原始音量）。只影响**之后**合成的新片。
     @AppStorage("audioVolume") private var audioVolume = 1.0
@@ -100,7 +116,17 @@ struct ContentView: View {
         p.contrast = contrast
         p.crop = crop
         p.audioVolume = audioVolume
+        // 去黑底：0 = 关；1 = 亮度键；2 = 滤色
+        p.keyMode = keyEnabled ? (keyModeIndex + 1) : 0
+        p.keyThreshold = keyThreshold
+        p.keySoftness = keySoftness
+        p.keyGain = keyGain
         return p
+    }
+
+    /// 去黑底开启后 alpha 变成「内容强度」，允许超过 1；关闭时仍是 0~1 的透明度。
+    private var alphaRange: ClosedRange<Double> {
+        keyEnabled ? 0.0...2.0 : 0.0...1.0
     }
 
     /// 参数 / 帧来源 / 帧版本任一变化都触发重新合成
@@ -180,6 +206,7 @@ struct ContentView: View {
         }
         .preferredColorScheme(.dark)
         .onAppear {
+            applyDefaultsMigration()
             session.frameStore = frames
             session.orchestrator = orchestrator
             session.update(params: fusionParams)
@@ -781,10 +808,45 @@ struct ContentView: View {
                 }
             }
 
+            // ---- 去黑底（0.6.2）----
+            // 眼镜屏幕物理上是「黑色不发光」，所以人眼看不到黑底；
+            // 但录屏截到的是不透明像素，成片里就成了一块黑矩形。这里按亮度把黑当「无」。
+            blockCard("去黑底", icon: "circle.lefthalf.filled") {
+                VStack(alignment: .leading, spacing: 9) {
+                    Toggle(isOn: $keyEnabled) {
+                        Text("黑色当作透明")
+                            .font(.system(size: 12.5))
+                            .foregroundStyle(Palette.label)
+                    }
+                    .tint(Palette.accent)
+
+                    Text(keyEnabled
+                         ? "开启后屏幕内容会按亮度叠加：纯黑处完全透出相机画面，亮字亮图正常显示。"
+                         : "关闭时屏幕画面整块盖在相机上，黑底会挡住后面的相机画面。")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(Palette.hint)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    if keyEnabled {
+                        pickerRow("模式", selection: $keyModeIndex, options: Options.keyModes)
+                        sliderRow("阈值", value: $keyThreshold, range: 0.02...0.25)
+                        sliderRow("软边", value: $keySoftness, range: 0.02...0.20)
+                        sliderRow("内容增益", value: $keyGain, range: 1.0...2.0)
+                        Text("阈值越低越容易把暗灰也当透；软边让边缘过渡不生硬；内容增益只加强可见内容，不加强被键掉的黑色。")
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(Palette.hint)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+
             // ---- 叠加效果 ----
             blockCard("叠加效果", icon: "square.on.square") {
                 VStack(spacing: 9) {
-                    sliderRow("屏幕透明度", value: $alpha, range: 0.0...1.0)
+                    // 去黑底开启后，「整体透明度」的语义变成「内容强度」：
+                    // 黑色已经被键掉了，还按整体透明度压的话亮字也会一起变淡。
+                    sliderRow(keyEnabled ? "内容强度" : "屏幕透明度",
+                              value: $alpha, range: alphaRange)
                     sliderRow("屏幕占比", value: $scale, range: 0.2...0.95)
                     sliderRow("水平位置", value: $offsetX, range: -0.5...0.5)
                     sliderRow("垂直位置", value: $offsetY, range: -0.5...0.5)
@@ -987,6 +1049,31 @@ struct ContentView: View {
     }
 
     // MARK: - 行为
+
+    /// 0.6.2 默认值迁移。
+    /// @AppStorage 一旦把值写进 UserDefaults，代码里改默认值对老用户就再也不生效了，
+    /// 界面会一直停在上一版的数字上。这里做一次性迁移，且**只改没被手动调过的项**：
+    /// 当前值仍等于旧默认值（误差 0.001 内）才替换，用户自己调过的保持原样。
+    private func applyDefaultsMigration() {
+        guard defaultsRev < 2 else { return }
+        let pairs: [(key: String, old: Double, new: Double)] = [
+            ("alpha", 0.55, 0.60),
+            ("scale", 0.55, 0.75),
+            ("corner", 0.10, 0.04),
+            ("edge", 0.12, 0.00),
+            ("contrast", 1.00, 0.75),
+            ("crop", 0.06, 0.00),
+        ]
+        let store = UserDefaults.standard
+        for p in pairs {
+            guard store.object(forKey: p.key) != nil else { continue }
+            let cur = store.double(forKey: p.key)
+            if abs(cur - p.old) < 0.001 {
+                store.set(p.new, forKey: p.key)
+            }
+        }
+        defaultsRev = 2
+    }
 
     private func refreshLanIP() {
         let ip = GlassesDiscovery.shared.displayLocalIP(for: orchestrator.glassesIP ?? host) ?? ""
